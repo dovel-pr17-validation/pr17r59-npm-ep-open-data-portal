@@ -1,0 +1,184 @@
+import {readFile} from 'node:fs/promises';
+import {viewReady} from './test-support/viewReady.mjs';
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {createElement,act} from 'react';
+import {Window} from 'happy-dom';
+import {freshLoader} from './test-support/viteRunner.mjs';
+
+// Synthetic directory: each unrelated row exercises one of the URL facets.
+const makeMember=(id,firstName,lastName,role,overrides={})=>({id,firstName,lastName,sortName:lastName+' '+firstName,gender:'',countryCode:'HU',groupCode:'PfE',memberships:[{id:'6567',role,classification:'COMMITTEE',current:true}],organizationMemberships:[{id:id===2||id===4?'6831':'9999',current:true}],accounts:[],...overrides});
+const members=[
+  makeMember(1,'Tamás','Deutsch','MEMBER'),
+  makeMember(2,'Annamária','Vicsek','MEMBER_SUBSTITUTE'),
+  makeMember(3,'Other','Country','MEMBER',{countryCode:'FR'}),
+  makeMember(4,'Other','Group','MEMBER',{groupCode:'EPP'}),
+  makeMember(5,'Other','Committee','MEMBER',{memberships:[]}),
+];
+const directory={day:'2026-10-17',members,committees:[{id:'6567',code:'BUDG',names:{en:'Budgets',hu:'Költségvetés'},classification:'COMMITTEE'}],index:{complete:true,loaded:members.length,total:members.length,failed:0,error:null}};
+const selection='committee=6567&country=HU&group=PfE';
+
+async function harness(t,query='lang=en&'+selection+'&role=member',sourceDirectory=directory,{stored=null}={}) {
+  const window=new Window({url:'http://localhost/?'+query}),unexpected=[];
+  if(stored)window.localStorage.setItem('ep.interface-language.v1',stored);
+  const globals={window,document:window.document,location:window.location,history:window.history,localStorage:window.localStorage,Event:window.Event,HTMLElement:window.HTMLElement,ResizeObserver:window.ResizeObserver,IntersectionObserver:window.IntersectionObserver,getComputedStyle:window.getComputedStyle.bind(window),IS_REACT_ACT_ENVIRONMENT:true};
+  const originals=new Map(Object.keys(globals).map(key=>[key,Object.getOwnPropertyDescriptor(globalThis,key)]));
+  for(const [key,value] of Object.entries(globals))Object.defineProperty(globalThis,key,{value,configurable:true,writable:true});
+  let root,loadModule;
+  t.after(async()=>{
+    if(root)await act(async()=>root.unmount());
+    if(loadModule)await loadModule.close();await window.happyDOM.close();
+    for(const [key,descriptor] of originals)descriptor?Object.defineProperty(globalThis,key,descriptor):delete globalThis[key];
+    assert.deepEqual(unexpected,[],'all requests use local fixtures');
+  });
+  t.mock.method(globalThis,'fetch',async input=>{
+    const url=new URL(input,location.href);
+    if(url.pathname==='/api/profile/1')return Response.json({...members[0],currentAffiliation:{status:'matched',day:'2026-10-31'},membershipHistory:{observationAvailable:true,observationComplete:true,items:[{index:0,section:'national-parties',bodyId:'org/6831',role:'def/ep-roles/MEMBER',classification:'def/ep-entities/NATIONAL_POLITICAL_GROUP',start:'2024-07-16',end:null,body:{prefLabel:{en:'Example party'}}}]}});
+    if(url.pathname==='/api/directory')return Response.json(sourceDirectory);
+    if(url.pathname.startsWith('/api/portrait/'))return new Response(null,{status:404});
+    if(url.pathname.startsWith('/api/latest-activities/'))return Response.json({categories:{},categoryGroups:[],categoryCoverage:{},items:[],selectedItems:[],indexedTotal:0,nextOffset:null,cache:{complete:true}});
+  if(url.pathname==='/api/vote-periods')return Response.json({version:3,weeks:[],coverage:{status:'unavailable',years:[]}});
+    if(url.pathname.startsWith('/api/speech-statistics/'))return Response.json({items:[],counts:{},groups:[],coverage:{available:0,total:0,complete:true,headers:0},sources:[],nextPage:null});
+    if(url.pathname==='/api/insights/speech-cloud')return Response.json({scope:{},words:[],speeches:[],coverage:{transcripts:0,complete:true},window:{},nextPage:null});
+    unexpected.push(url.href);throw Error('Unexpected fixture request: '+url.href);
+  });
+  loadModule=await freshLoader({configFile:false,server:{middlewareMode:true,hmr:false,ws:false,watch:null},optimizeDeps:{noDiscovery:true},oxc:{jsx:{runtime:'automatic'}}});
+  const {default:App}=await loadModule('/src/App.tsx'),{createRoot}=await import('react-dom/client');
+  const container=document.createElement('div');document.body.append(container);root=createRoot(container);
+  await act(async()=>root.render(createElement(App)));await viewReady(container);
+  const select=(node,value)=>act(async()=>{assert(node,'Missing select');node.value=value;node.dispatchEvent(new window.Event('change',{bubbles:true}));});
+  const click=async text=>{await act(async()=>{const node=[...container.querySelectorAll('.parliament-header nav button')].find(node=>node.textContent===text);assert(node,'Missing navigation: '+text);node.click();});await viewReady(container);};
+  const go=delta=>act(async()=>{
+    let timer,listener;
+    const popped=new Promise((resolve,reject)=>{listener=resolve;window.addEventListener('popstate',listener,{once:true});timer=setTimeout(()=>reject(Error('Missing popstate for history.go('+delta+')')),5000);});
+    try{history.go(delta);await popped;}finally{clearTimeout(timer);window.removeEventListener('popstate',listener);}
+  });
+  const filters=()=>[...container.querySelectorAll('.explorer-filters select')];
+  const language=()=>container.querySelector('.explorer-language-control select');
+  function agree(role,lang='en',urlLang=(lang==='en') ? null : lang) {
+    const query=new URLSearchParams(location.search);
+    assert.deepEqual(filters().map(node=>node.value),['6567',role,'HU','PfE'],'rendered filter controls');
+    assert.deepEqual(['committee','role','country','group','lang'].map(key=>query.get(key)),['6567',role==='both'?null:role,'HU','PfE',urlLang],'URL filters omit defaults');
+    assert.equal(language().value,lang);assert.equal(document.documentElement.lang,lang);
+    const expected=role==='member'?[members[0]]:role==='substitute'?[members[1]]:members.slice(0,2);
+    assert.deepEqual([...container.querySelectorAll('[data-member-id]')].map(node=>Number(node.dataset.memberId)),expected.map(row=>row.id),'actual filtered member identities');
+    for(const row of expected)assert.match(container.querySelector(`[data-member-id="${row.id}"]`).textContent,new RegExp(row.firstName+'\\s*'+row.lastName));
+  }
+  const open=async id=>{await act(async()=>{const node=container.querySelector(`[data-member-id="${id}"] button`);assert(node,'Missing portrait: '+id);node.click();});await viewReady(container);};
+  return {window,container,select,click,go,filters,language,agree,open};
+}
+
+test('Back and Forward restore Membership, every URL filter and actual directory results',async t=>{
+  const h=await harness(t);h.agree('member');
+  const initial=location.href;
+  await h.click({en:'Following',hu:'Követve',fr:'Suivi'}[h.language().value]);await h.click({en:'MEPs',hu:'Képviselők',fr:'Députés'}[h.language().value]);
+  await h.select(h.filters()[1],'substitute');h.agree('substitute');
+  const later=location.href,length=history.length,incoming=[];
+  h.window.addEventListener('popstate',()=>incoming.push(location.href));
+  await h.go(-2);assert.equal(incoming.at(-1),initial);assert.equal(location.href,initial);h.agree('member');
+  await h.go(2);assert.equal(incoming.at(-1),later);assert.equal(location.href,later);h.agree('substitute');
+  assert.equal(history.length,length,'restoration does not add history entries');
+});
+
+test('language follows history alongside Membership without overwriting restored parameters',async t=>{
+  const h=await harness(t,'lang=hu&'+selection+'&role=member');h.agree('member','hu');
+  await h.click({en:'Following',hu:'Követve',fr:'Suivi'}[h.language().value]);await h.click({en:'MEPs',hu:'Képviselők',fr:'Députés'}[h.language().value]);
+  await h.select(h.filters()[1],'substitute');await h.select(h.language(),'fr');h.agree('substitute','fr');
+  await h.go(-2);h.agree('member','hu');
+  await h.go(1);assert.equal(new URLSearchParams(location.search).get('view'),'saved');assert.equal(h.language().value,'hu');
+  await h.go(1);h.agree('substitute','fr');
+});
+
+for(const query of [selection,selection+'&role=invalid&lang=invalid'])test('history applies initial-load defaults for '+query,async t=>{
+  const h=await harness(t,query);h.agree('both');
+  await h.click({en:'Following',hu:'Követve',fr:'Suivi'}[h.language().value]);await h.click({en:'MEPs',hu:'Képviselők',fr:'Députés'}[h.language().value]);
+  await h.select(h.filters()[1],'substitute');await h.select(h.language(),'hu');
+  // Retain the raw old URL so popstate must validate absent/unsupported values;
+  // a missing or unsupported language resolves to the saved choice.
+  await act(async()=>{history.replaceState(null,'','/?'+query);h.window.dispatchEvent(new h.window.PopStateEvent('popstate'));});
+  h.agree('both','hu');
+});
+
+test('an explicit English link stays English in the URL and on reload when the saved choice differs',async t=>{
+  const h=await harness(t,'lang=en&'+selection+'&role=member',directory,{stored:'de'});
+  h.agree('member','en','en');
+  const script=await readFile(new URL('../public/assets/interface-language.js',import.meta.url),'utf8');
+  new h.window.Function(script)();
+  assert.equal(new URLSearchParams(location.search).get('lang'),'en','the startup script keeps the explicit English link');
+  await h.select(h.language(),'fr');h.agree('member','fr');
+  await h.select(h.language(),'en');h.agree('member','en');
+  assert.equal(h.window.localStorage.getItem('ep.interface-language.v1'),'en','choosing English saves it, so English is implicit again');
+});
+
+test('Back to an entry without a language follows the saved choice',async t=>{
+  const h=await harness(t,selection+'&role=member');h.agree('member');
+  await h.click('Following');await h.select(h.language(),'fr');
+  assert.equal(new URLSearchParams(location.search).get('lang'),'fr');
+  await h.go(-1);h.agree('member','fr');
+});
+
+test('opening and leaving an MEP from the member wall are Back/Forward steps',async t=>{
+  const h=await harness(t);h.agree('member');
+  const wall=location.href,length=history.length;
+  await h.open(1);
+  const profile=location.href,query=new URLSearchParams(location.search);
+  assert.equal(history.length,length+1,'opening an MEP adds one history entry');
+  assert.equal(query.get('member'),'1');assert.equal(h.container.querySelector('.explorer-profile h1')?.getAttribute('aria-label'),'Tamás Deutsch');
+  await h.go(-1);assert.equal(location.href,wall);assert.equal(h.container.querySelector('.explorer-profile'),null);h.agree('member');
+  await h.go(1);assert.equal(location.href,profile);assert.equal(h.container.querySelector('.explorer-profile h1')?.getAttribute('aria-label'),'Tamás Deutsch');
+  await act(async()=>h.container.querySelector('.explorer-back').click());
+  assert.equal(history.length,length+2,'leaving the MEP adds one history entry');h.agree('member');
+  await h.go(-1);assert.equal(location.href,profile);assert(h.container.querySelector('.explorer-profile'));
+});
+
+ test('profile organisation link clears unrelated facets and Back restores the profile',async t=>{
+  const h=await harness(t,'member=1&module=profile&'+selection+'&role=substitute');
+  const link=[...h.container.querySelectorAll('a')].find(a=>a.textContent==='Example party');assert(link);
+  await act(async()=>link.click());await viewReady(h.container);
+  assert.equal(new URLSearchParams(location.search).get('organization'),'6831');
+  for(const key of ['member','committee','group','country','role'])assert.equal(new URLSearchParams(location.search).get(key),null,key);
+  assert.deepEqual([...h.container.querySelectorAll('[data-member-id]')].map(n=>Number(n.dataset.memberId)),[4,2]);
+  await h.go(-1);await viewReady(h.container);assert.equal(new URLSearchParams(location.search).get('member'),'1');
+  await h.go(1);await viewReady(h.container);assert.equal(new URLSearchParams(location.search).get('organization'),'6831');
+  await act(async()=>h.container.querySelector('.explorer-organization-filter button').click());
+  assert.equal(new URLSearchParams(location.search).get('organization'),null);
+ });
+
+ test('a link to a listed committee selects that committee in the filter',async t=>{
+  const h=await harness(t,'organization=6567&organization-name=Committee+on+Budgets');
+  const query=new URLSearchParams(location.search);
+  assert.equal(query.get('committee'),'6567');
+  for(const key of ['organization','organization-name'])assert.equal(query.get(key),null,key);
+  assert.equal(h.container.querySelector('.explorer-organization-filter'),null);
+  assert.equal(h.container.querySelector('.explorer-filters select').value,'6567');
+  assert.equal(h.container.querySelector('.explorer-results strong').textContent,'4');
+  const role=h.container.querySelectorAll('.explorer-filters select')[1];
+  await act(async()=>{role.value='substitute';role.dispatchEvent(new window.Event('change',{bubbles:true}));});
+  assert.deepEqual([...h.container.querySelectorAll('[data-member-id]')].map(n=>Number(n.dataset.memberId)),[2]);
+ });
+
+ test('uncertain observations of a listed committee keep its count qualified',async t=>{
+  const sourceDirectory={...directory,members:members.map(m=>({...m,organizationMemberships:m.id===5?[{id:'6567',current:null}]:[],organizationMembershipsComplete:m.id!==5}))};
+  const h=await harness(t,'organization=6567',sourceDirectory);
+  assert.equal(new URLSearchParams(location.search).get('committee'),'6567');
+  assert.equal(h.container.querySelector('.explorer-results strong').textContent,'4+');
+ });
+
+ test('unavailable membership observations keep a committee count qualified',async t=>{
+  const sourceDirectory={...directory,members:members.map(m=>({...m,organizationMemberships:m.id===5?null:[],organizationMembershipsComplete:m.id!==5}))};
+  const h=await harness(t,'committee=6567',sourceDirectory);
+  assert.equal(h.container.querySelector('.explorer-results strong').textContent,'4+');
+ });
+
+ test('uncertainty about another body leaves a committee count exact',async t=>{
+  const sourceDirectory={...directory,members:members.map(m=>({...m,organizationMemberships:[{id:'9999',current:null}],organizationMembershipsComplete:false}))};
+  const h=await harness(t,'committee=6567',sourceDirectory);
+  assert.equal(h.container.querySelector('.explorer-results strong').textContent,'4');
+ });
+
+ test('uncertain observations never make a loaded organisation filter count definitive',async t=>{
+  const sourceDirectory={...directory,members:members.map(m=>({...m,organizationMemberships:m.id===4?[{id:'6831',current:true}]:[{id:'6831',current:null}],organizationMembershipsComplete:m.id===4}))};
+  const h=await harness(t,'organization=6831',sourceDirectory);
+  assert.equal(h.container.querySelector('.explorer-results strong').textContent,'1+');
+  assert.deepEqual([...h.container.querySelectorAll('[data-member-id]')].map(n=>Number(n.dataset.memberId)),[4]);
+ });

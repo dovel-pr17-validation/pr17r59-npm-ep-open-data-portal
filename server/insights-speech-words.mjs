@@ -1,0 +1,86 @@
+import {sourceAvailability} from './source-availability.mjs';
+import {retainedSpeechPage} from './corpus-speeches.mjs';
+import {languagePreference} from './language-order.mjs';
+import {readFile,stat} from 'node:fs/promises';
+import {createHash} from 'node:crypto';
+import path from 'node:path';
+import stopwordLists from './insights-speech-stopwords.json' with {type:'json'};
+import {HttpError} from './http-utils.mjs';
+import {insightQuery} from './insights-store.mjs';
+import {transcriptLanguage} from './transcript-language.mjs';
+import {speechParagraphText} from './transcript-text.mjs';
+export const SPEECH_WORDS_VERSION=2;
+import {retainedSpeechData} from './corpus-speeches.mjs';
+export const speechWordLanguages=Object.freeze(Object.keys(stopwordLists));
+const filterKey=(word,language)=>{const key=word.normalize('NFKC').toLocaleLowerCase(language);return language==='mt'?key:key.normalize('NFD').replace(/\p{M}/gu,'');};
+const filters=new Map(Object.entries(stopwordLists).map(([lang,words])=>[lang,new Set(words.map(w=>filterKey(w,lang)))]));
+filters.get('en').delete('ai');
+for(const word of 'mr mrs ms madam mister president chairman chair thank thanks honourable honorable colleagues ladies gentlemen parliament european commission council speaker directive regulation policy act article day days today yesterday tomorrow week weeks year years commissioner commissioners minister ministers union fellow members europe people support country countries future live important need needs'.split(' '))filters.get('en').add(word);
+for(const word of 'elnök elnökasszony asszony úr köszönöm tisztelt képviselőtársaim képviselőtársak'.split(' '))filters.get('hu').add(filterKey(word,'hu'));
+for(const word of 'bhfuil bhfuil bhí bheidh bheith bhíonn seo sin siúd agam agat againn agaibh acu anois freisin'.split(' '))filters.get('ga').add(filterKey(word,'ga'));
+export function speechWordsQuery(search,{now=Date.now()}={}) {
+  for(const key of search.keys())if(!['lang','member','days','end'].includes(key)||search.getAll(key).length!==1)throw new HttpError(400,'invalid_query','Unsupported or repeated speech-word query.');
+  const member=search.get('member');if(!/^[1-9]\d{0,8}$/.test(member||''))throw new HttpError(400,'invalid_member','Choose a MEP.');
+  const base=new URLSearchParams(search);base.delete('member');const query=insightQuery(base,{now});
+  if(!filters.has(query.language))throw new HttpError(400,'unsupported_analysis_language','Word filtering is not available for this language.');
+  return {...query,member};
+}
+export {speechParagraphText} from './transcript-text.mjs';
+export function speechWordTokens(text,language){
+  const filter=filters.get(language);if(!filter)return [];
+  let normalized=text.normalize('NFKC').toLocaleLowerCase(language);
+  if(language==='mt')normalized=normalized.replace(/[‘’ʼ]/gu,"'");
+  // Maltese hyphens delimit articles (including fused prepositions). Keep
+  // apostrophes within words; remove only the documented one-letter proclitics.
+  const pattern=language==='mt'?/\p{L}[\p{L}\p{M}]*(?:'[\p{L}\p{M}]+)*'?/gu:/(?:\bai\b|\p{L}[\p{L}\p{M}]{2,39})/gu;
+  const matches=[...normalized.matchAll(pattern)]
+    .filter(match=>!/[\d%][-‐‑–]?$/u.test(normalized.slice(Math.max(0,match.index-4),match.index)));
+  if(language!=='mt')return matches.map(match=>match[0]).filter(word=>!filter.has(filterKey(word,language)));
+  // A final apostrophe after a vowel is lexical (sema' "heard", not sema "sky")
+  // unless it closes a quotation: the last such apostrophe before punctuation
+  // or another quotation opens. 'l and 'il before a space are elisions.
+  const end=match=>match.index+match[0].length,boundary=(from,to)=>/[.!?\n]/u.test(normalized.slice(from,to));
+  const opens=match=>normalized[match.index-1]==="'"&&!(/^(?:l|il)$/u.test(match[0])&&normalized[end(match)]!=='-');
+  const closedLater=index=>{for(let next=index+1;next<matches.length;next++){if(/[^\s\-‐‑]/u.test(normalized.slice(end(matches[next-1]),matches[next].index))||opens(matches[next]))return false;if(matches[next][0].endsWith("'"))return true;}return false;};
+  let quoted=false;
+  return matches.map((match,index)=>{
+    if(index&&boundary(end(matches[index-1]),match.index))quoted=false;
+    if(opens(match))quoted=true;
+    let word=match[0];
+    if(word.endsWith("'")){
+      const lexical=/[aeiou]'$/u.test(word);
+      if(quoted&&!(lexical&&closedLater(index))){word=word.slice(0,-1);quoted=false;}
+      else if(!quoted&&!lexical)word=word.slice(0,-1);
+    }
+    return word.replace(/^[bfmst]'/u,'');
+  }).filter(word=>{const letters=[...word.replace(/'/gu,'')].length;return letters>=3&&letters<=40&&!filter.has(filterKey(word,language));});
+}
+export const speechWordStopwords=language=>new Set(filters.get(language)||[]);
+export class SpeechWordInsights {
+  constructor(store,{clock=Date.now,directory=process.env.ODP_CACHE_DIR,readTranscript,readCorpusData=retainedSpeechData,readCorpusPage=retainedSpeechPage}={}){this.store=store;this.clock=clock;this.directory=directory;this.readTranscript=readTranscript;this.readCorpusData=readCorpusData;this.readCorpusPage=readCorpusPage;this.cache=new Map();this.pending=new Map();}
+  async query(query){const status=this.store.status(),key=JSON.stringify([status.servingGeneration,status.availabilityRevision,query.member,query.language,query.start,query.end]),old=this.cache.get(key);if(old&&this.clock()-old.at<60_000)return old.value;if(this.pending.has(key))return this.pending.get(key);
+    const job=this.build(query,status);this.pending.set(key,job);try{const value=await job;this.cache.set(key,{at:this.clock(),value});while(this.cache.size>12)this.cache.delete(this.cache.keys().next().value);return value;}finally{this.pending.delete(key);}}
+  async build(query,status){
+    const person=this.store.db.prepare('SELECT body FROM members WHERE id=?').get(query.member);if(!person)throw new HttpError(404,'member_not_found','This MEP is not in the current roster.');
+    const where="generation=? AND mep=? AND category='plenary-contributions' AND json_extract(body,'$.speechKind')='PLENARY_DEBATE_SPEECH' AND date BETWEEN ? AND ?",params=[status.servingGeneration,query.member,query.start,query.end];
+    const count=this.store.db.prepare('SELECT COUNT(*) n FROM items WHERE '+where).get(...params).n;
+    const rows=this.store.db.prepare('SELECT source_id,body FROM items WHERE '+where+' ORDER BY date DESC,source_id LIMIT 100').all(...params),words=new Map(),speeches=[];let rawBytes=0,xmlBytes=0,bounded=false,missing=0,wrongLanguage=0,invalid=0;
+    const retained=await this.readCorpusData({sourceIds:rows.map(row=>row.source_id),language:query.language});
+    const stored=new Map((retained?.records||[]).map(record=>[record.id,record]));
+    for(const row of rows){
+      const retainedText=stored.get(row.source_id)?.text;
+      let record=null;const url='https://data.europarl.europa.eu/api/v2/speeches/'+row.source_id+'?include-output=xml_fragment&format=application%2Fld%2Bjson';
+      if(retainedText)record={fetchedAt:Date.parse(retainedText.fetchedAt)};
+      else try{if(this.readTranscript)record=await this.readTranscript(row.source_id);else if(this.directory){const hashed=path.join(this.directory,createHash('sha256').update(url).digest('hex')+'.json'),legacy=Buffer.from(url).toString('base64url')+'.json';let file=hashed,size;try{size=(await stat(file)).size;}catch(error){if(legacy.length>255)throw error;file=path.join(this.directory,legacy);size=(await stat(file)).size;}if(size>6*1024*1024){bounded=true;continue;}if(rawBytes+size>16*1024*1024){bounded=true;break;}rawBytes+=size;record=JSON.parse(await readFile(file,'utf8'));if(record.url!==url)record=null;}}catch{}
+      const activity=(Array.isArray(record?.payload?.data)?record.payload.data:[]).find(node=>node.activity_id===row.source_id);if(!activity&&!retainedText){if(stored.get(row.source_id)?.availableLanguages.length)wrongLanguage++;else missing++;continue;}
+      const docs=activity?.recorded_in_a_realization_of||[],xml=retainedText?.body||docs.map(d=>d?.['api:xmlFragment']?.[query.language]).filter(v=>typeof v==='string').join('\n');if(!xml){wrongLanguage++;continue;}
+      if(xmlBytes+Buffer.byteLength(xml)>4*1024*1024){bounded=true;break;}xmlBytes+=Buffer.byteLength(xml);
+      const paragraphText=retainedText?.body||docs.map(d=>speechParagraphText(d?.['api:xmlFragment']?.[query.language])).filter(Boolean).join(' ');if(!paragraphText){invalid++;continue;}
+      const source=JSON.parse(row.body),tokens=speechWordTokens(paragraphText,query.language),info=retainedText?{machine:retainedText.translationType==='machine'}:transcriptLanguage(xml);speeches.push({id:row.source_id,date:source.date,title:source.titles?.[languagePreference(Object.keys(source.titles||{}).filter(code=>typeof source.titles[code]==='string'&&source.titles[code].trim()),query.language)[0]]||'Speech',machineTranslation:info.machine,sourceFetchedAt:Number.isFinite(record.fetchedAt)?new Date(record.fetchedAt).toISOString():null});
+      const counts=new Map();for(const word of tokens)counts.set(word,(counts.get(word)||0)+1);for(const [word,n] of counts){const previous=words.get(word)||{word,speechCount:0,occurrences:0,speechIds:[]};previous.speechCount++;previous.occurrences+=n;if(previous.speechIds.length<5)previous.speechIds.push(row.source_id);words.set(word,previous);}
+    }
+    const collection=await this.readCorpusPage({from:query.start,to:query.end,language:query.language,limit:1});
+    const availability=collection?.coverage?.availability?.text||sourceAvailability({sourceKey:'speech-text',family:'speeches',stage:'text',language:query.language,start:query.start,end:query.end,limited:true});
+    return {availability,view:'speech-words',member:query.member,language:query.language,availableAnalysisLanguages:speechWordLanguages,window:{start:query.start,end:query.end,days:query.days},words:[...words.values()].sort((a,b)=>b.speechCount-a.speechCount||b.occurrences-a.occurrences||a.word.localeCompare(b.word,query.language)).slice(0,60),speeches,coverage:{indexedSpeeches:count,consideredSpeeches:rows.length,analyzedTranscripts:speeches.length,missingSavedDetail:missing,missingRequestedLanguage:wrongLanguage,unreadableText:invalid,truncated:count>rows.length||bounded,indexComplete:status.complete,rawBytes,xmlBytes},basis:'Requested-language saved transcript paragraphs only; never falls back to another language or downloads speech text. Words ranked by distinct speeches; stopwords removed, inflections kept separate.',computedAt:new Date(this.clock()).toISOString()};
+  }
+}

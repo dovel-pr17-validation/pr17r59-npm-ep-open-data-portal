@@ -1,0 +1,863 @@
+import {prepareWeekClouds,readWeekCloud} from './week-cloud-projection.mjs';
+import {corpusTextVersion,prepareCorpusTexts} from './corpus-text-schema.mjs';
+import {availabilityHistoryVersion,initializeAvailabilityHistory,observeSource,observeCheck,finishAvailabilityWrite,historyStatus} from './availability-history.mjs';
+import {sourceAvailability} from './source-availability.mjs';
+import {availabilityGap} from './availability-evidence.mjs';
+import {brusselsDay} from './analysis-period.mjs';
+import {DOCX_EXTRACTION_VERSION} from './docx-source-structure.mjs';
+import {sourceMissing, missingSourceDelay, transientSourceDelay, confirmSourceRejection, SOURCE_RECHECK_MS, sourceDescriptor} from './source-retry.mjs';
+import {languagePreference} from './language-order.mjs';
+import { DatabaseSync } from 'node:sqlite';
+import { randomUUID, createHash } from 'node:crypto';
+import { existsSync, mkdirSync } from 'node:fs';
+import { stat } from 'node:fs/promises';
+import { zstdCompressSync, zstdDecompressSync } from 'node:zlib';
+import path from 'node:path';
+import {XMLParser,XMLBuilder,XMLValidator} from 'fast-xml-parser';
+import {countryCode} from './insights-countries.mjs';
+import {speechSummary,chooseTranscript} from './odp.mjs';
+import {speechSpeakerDetails} from './speech-speakers.mjs';
+import {reuseSpeechRole} from './speaker-role-reuse.mjs';
+import {speakerRoleLabel} from '../src/speakerRoles.mjs';
+import {speechPeople,interventionMetadata,INTERVENTION_CLASSIFICATION_VERSION} from './speech-interventions.mjs';
+import {observeSqlite} from './sqlite-observability.mjs';
+import {questionAddressees} from './question-addressees.mjs';
+
+// Full-text corpus of speeches, questions and answers. It lives beside the
+// activity index but outside its refresh generations, so a refresh never copies
+// stored text. `documents.source_id` is the exact API identifier and joins to
+// the attached index's `items.source_id`.
+export const CORPUS_STATUS_VERSION=2;
+export const CORPUS_COVERAGE_VERSION=2;
+// All entries are required by preparation; history remains prepared on acquire.
+export const CORPUS_SCHEMA_GATES=Object.freeze([
+  {key:'resourceIndexes',value:1},
+  {key:'availabilityHistoryVersion',value:availabilityHistoryVersion,constructorGate:false,writerGate:false},
+  {key:'speechMemberIndex',value:2},
+  {key:'questionDiscoveryVersion',value:1},
+  {key:'corpusTextVersion',value:corpusTextVersion},
+  {key:'weekCloudSchema',value:3,constructorGate:false},
+].map(Object.freeze));
+
+const KINDS=['speech','question','answer'];
+const parse=value=>value==null?null:JSON.parse(value);
+const sha=value=>createHash('sha256').update(value).digest('hex');
+const headerParser=new XMLParser({ignoreAttributes:false,parseTagValue:false,trimValues:false});
+const headerBuilder=new XMLBuilder({ignoreAttributes:false});
+const array=value=>value==null?[]:Array.isArray(value)?value:[value];
+const attributes=node=>Object.fromEntries(Object.entries(node||{}).filter(([key])=>key.startsWith('@_')));
+
+// Empty contributions can have useful headers without any paragraph to retain
+// in texts. Keep only classification headers, never another transcript copy.
+function interventionHeaders(fragments) {
+  const headers={};let bytes=0;
+  for(const [language,xml] of Object.entries(fragments)) {
+    if(typeof xml!=='string'||Buffer.byteLength(xml)>2*1024*1024||/<!DOCTYPE|<!ENTITY/i.test(xml)||XMLValidator.validate(xml)!==true)continue;
+    const parsed=headerParser.parse(xml);
+    const rootName=['oralStatements','writtenStatements'].find(key=>parsed[key]);
+    if(!rootName)continue;
+    const root=parsed[rootName];
+    const [kind,node]=Object.entries(root).flatMap(([key,value])=>array(value).map(node=>[key,node])).find(([,node])=>node?.from)||[];
+    if(!node)continue;
+    const header=headerBuilder.build({[rootName]:{...attributes(root),[kind]:{...attributes(node),from:node.from}}});
+    bytes+=Buffer.byteLength(header);
+    if(Buffer.byteLength(header)>16*1024||bytes>256*1024||Object.keys(headers).length>=64)throw new Error('Speech classification headers exceeded the allowed size.');
+    headers[language]=header;
+  }
+  return headers;
+}
+export const CORPUS_LIMITS=Object.freeze({searchLimit:50,searchOffset:1000,queryLength:200,queryTerms:12,sourceIds:1000,requestBytes:128*1024,highlightBytes:512*1024,highlightRanges:10000});
+
+function matchRanges(marked,limit) {
+  const ranges=[];let cursor=0,position=0,truncated=false;
+  for(;;) {
+    const start=marked.indexOf('\u0002',cursor);if(start<0)break;
+    const end=marked.indexOf('\u0003',start+1);if(end<0)break;
+    position+=start-cursor;
+    if(ranges.length<limit)ranges.push({start:position,end:position+end-start-1});else truncated=true;
+    position+=end-start-1;cursor=end+1;
+  }
+  return {highlightRanges:ranges,highlightsTruncated:truncated};
+}
+
+// Accept words and "quoted phrases" only. Each becomes a quoted FTS5 string, so
+// user input cannot reach column filters, NEAR, prefix or boolean operators.
+export function corpusQuery(input) {
+  const text=String(input||'').normalize('NFC').trim();
+  if(!text || text.length>CORPUS_LIMITS.queryLength)return null;
+  const terms=[...text.matchAll(/"([^"]+)"|([^\s"]+)/g)].map(match=>(match[1]??match[2]).replace(/[^\p{L}\p{M}\p{N}'’\- ]/gu,' ').trim().replace(/\s+/g,' ')).filter(Boolean);
+  if(!terms.length || terms.length>CORPUS_LIMITS.queryTerms)return null;
+  return terms.map(term=>'"'+term.replaceAll('"','""')+'"').join(' ');
+}
+
+export class CorpusStore {
+  constructor(directory,{indexFile=null,clock=Date.now,readOnly=false,initializeIndexes=false}={}) {
+    if(!readOnly)mkdirSync(directory,{recursive:true});
+    this.clock=clock;this.owner=randomUUID();this.readOnly=readOnly;
+    this.filename=path.join(directory,'corpus-v1.sqlite');
+    this.initializeIndexes=!readOnly&&(initializeIndexes||!existsSync(this.filename));
+    this.db=observeSqlite(new DatabaseSync(this.filename,{readOnly}),'corpus');
+    this.db.function('speech_order_ms',{deterministic:true},(start,date)=>{const value=Date.parse(start||date);return Number.isFinite(value)?value:null;});
+    this.db.function('question_addressee_ids',{deterministic:true},body=>body===null?null:JSON.stringify(questionAddressees(parse(body)).map(item=>item.id)));
+    if(!this.initializeIndexes) {
+      try {if(CORPUS_SCHEMA_GATES.some(gate=>gate.constructorGate!==false&&this.get(gate.key)!==gate.value))throw new Error('Unprepared corpus indexes.');}
+      catch {this.db.close();throw new Error('Corpus indexes need preparation. Stop the app and run node server/migrate-indexes.mjs before starting it.');}
+    }
+    if(readOnly)this.db.exec('PRAGMA busy_timeout=250; PRAGMA query_only=ON;');
+    else if(this.initializeIndexes)this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;
+      CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS lease (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT, expires INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS documents (
+        id INTEGER PRIMARY KEY, source_id TEXT NOT NULL UNIQUE, kind TEXT NOT NULL CHECK(kind IN ('speech','question','answer')),
+        parent_id TEXT, date TEXT, term INTEGER, original_languages TEXT NOT NULL DEFAULT '[]');
+      CREATE TABLE IF NOT EXISTS speech_metadata (source_id TEXT PRIMARY KEY, body BLOB NOT NULL, source_url TEXT NOT NULL, fetched_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS speech_catalog (source_id TEXT PRIMARY KEY, date TEXT, kind TEXT, start TEXT, numbering INTEGER, participants TEXT NOT NULL DEFAULT '[]',available_languages TEXT NOT NULL DEFAULT '[]',revision INTEGER NOT NULL DEFAULT 0,fetched_at TEXT);
+      CREATE INDEX IF NOT EXISTS speech_catalog_window ON speech_catalog(kind,date,source_id);
+      CREATE INDEX IF NOT EXISTS document_kind_date ON documents(kind,date DESC);
+      CREATE INDEX IF NOT EXISTS document_parent ON documents(parent_id) WHERE parent_id IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS texts (
+        id INTEGER PRIMARY KEY, document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        language TEXT NOT NULL, source_key TEXT NOT NULL, translation_type TEXT NOT NULL CHECK(translation_type IN ('original','machine','unspecified')),
+        source_format TEXT NOT NULL CHECK(source_format IN ('xml-fragment','docx','pdf')), source_url TEXT NOT NULL,
+        fetched_at TEXT NOT NULL, checked_at TEXT NOT NULL, sha256 TEXT NOT NULL, chars INTEGER NOT NULL,
+        body TEXT NOT NULL, raw BLOB, source_edition TEXT, UNIQUE(document_id,source_key));
+      CREATE INDEX IF NOT EXISTS text_language ON texts(language,document_id);
+      CREATE INDEX IF NOT EXISTS text_source_url ON texts(source_url);
+      CREATE INDEX IF NOT EXISTS text_status_metadata ON texts(document_id,language,chars);
+      CREATE VIRTUAL TABLE IF NOT EXISTS texts_fts USING fts5(body, content='texts', content_rowid='id', tokenize='unicode61 remove_diacritics 2');
+      CREATE TRIGGER IF NOT EXISTS texts_ai AFTER INSERT ON texts BEGIN INSERT INTO texts_fts(rowid,body) VALUES (NEW.id,NEW.body); END;
+      CREATE TRIGGER IF NOT EXISTS texts_ad AFTER DELETE ON texts BEGIN INSERT INTO texts_fts(texts_fts,rowid,body) VALUES ('delete',OLD.id,OLD.body); END;
+      CREATE TRIGGER IF NOT EXISTS texts_au AFTER UPDATE OF body ON texts BEGIN
+        INSERT INTO texts_fts(texts_fts,rowid,body) VALUES ('delete',OLD.id,OLD.body); INSERT INTO texts_fts(rowid,body) VALUES (NEW.id,NEW.body); END;
+      CREATE TABLE IF NOT EXISTS tasks (key TEXT PRIMARY KEY, kind TEXT NOT NULL, body TEXT NOT NULL, priority INTEGER NOT NULL,
+        done INTEGER NOT NULL DEFAULT 0, done_at INTEGER, attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0, error TEXT);
+      CREATE INDEX IF NOT EXISTS task_next ON tasks(done,priority DESC,retry_at);
+      CREATE INDEX IF NOT EXISTS task_status_counts ON tasks(kind,done,error);
+      CREATE INDEX IF NOT EXISTS task_status_error ON tasks(done,retry_at DESC,key,error,attempts) WHERE done=0 AND error IS NOT NULL;
+      INSERT OR IGNORE INTO meta VALUES ('schema','1');`);
+    if(!readOnly&&!this.initializeIndexes)this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;');
+    if(!readOnly)this.db.exec(`CREATE TABLE IF NOT EXISTS source_failures (key TEXT PRIMARY KEY, state TEXT NOT NULL, reason TEXT NOT NULL, descriptor TEXT NOT NULL, content_hash TEXT, parser_version INTEGER NOT NULL, next_check INTEGER); CREATE INDEX IF NOT EXISTS source_failure_due ON source_failures(next_check) WHERE next_check IS NOT NULL; CREATE INDEX IF NOT EXISTS source_failure_parser ON source_failures(parser_version); CREATE INDEX IF NOT EXISTS source_failure_state ON source_failures(state,key);`);
+    if(this.get('schema')!==1)throw new Error('Unsupported corpus schema.');
+    if(!readOnly&&this.get('speechMetadataVersion')!==1) {
+      this.set('speechMetadataBackfill',Boolean(this.db.prepare("SELECT 1 FROM documents WHERE kind='speech' LIMIT 1").get()));
+      this.set('speechMetadataVersion',1);
+    }
+    this.indexFile=indexFile;this.indexAttached=false;this.attachIndex();
+  }
+  // Read-only: the activity worker remains the only index writer.
+  attachIndex() {
+    if(!this.indexAttached && this.indexFile && existsSync(this.indexFile)) {
+      this.db.prepare('ATTACH DATABASE ? AS idx').run('file:'+encodeURI(this.indexFile)+'?mode=ro');
+      this.db.exec('PRAGMA idx.cache_size=-2048; PRAGMA idx.mmap_size=0;');
+      this.indexAttached=true;
+    }
+    return this.indexAttached;
+  }
+  get(key){return parse(this.db.prepare('SELECT value FROM meta WHERE key=?').get(key)?.value);}
+  set(key,value){this.db.prepare('INSERT OR REPLACE INTO meta VALUES (?,?)').run(key,JSON.stringify(value));}
+  transaction(fn) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try{const out=fn();this.db.exec('COMMIT');this.onCommit?.();return out;}catch(error){this.db.exec('ROLLBACK');throw error;}
+  }
+  snapshot(fn) {
+    // Hold one WAL read snapshot across count, page and provenance queries.
+    // A background writer can keep collecting without changing a result midway.
+    this.db.exec('BEGIN');
+    try{const out=fn();this.db.exec('COMMIT');return out;}catch(error){this.db.exec('ROLLBACK');throw error;}
+  }
+  acquire(ttl=90_000) {
+    let initialized=false;
+    const acquired=this.transaction(()=>{
+      const old=this.db.prepare('SELECT * FROM lease WHERE id=1').get();
+      if(old && old.owner!==this.owner && old.expires>this.clock())return false;
+      const initialize=this.get('resourceIndexes')!==1;
+      if(!this.initializeIndexes&&CORPUS_SCHEMA_GATES.some(gate=>gate.writerGate!==false&&this.get(gate.key)!==gate.value))throw new Error('Run node server/migrate-indexes.mjs before starting the app.');
+      this.db.prepare('INSERT OR REPLACE INTO lease VALUES (1,?,?)').run(this.owner,this.clock()+ttl);
+      initializeAvailabilityHistory(this);
+      if(this.get('corpusTextVersion')!==corpusTextVersion){prepareCorpusTexts(this.db);this.set('corpusTextVersion',corpusTextVersion);initialized=true;}
+      if(initialize) {
+        this.db.exec('CREATE TABLE IF NOT EXISTS speech_catalog_dirty (source_id TEXT PRIMARY KEY)');
+        for(const sql of [
+          'CREATE INDEX IF NOT EXISTS task_pending_order ON tasks(priority DESC,key DESC,retry_at) WHERE done=0',
+          'CREATE INDEX IF NOT EXISTS task_pending_due ON tasks(retry_at) WHERE done=0',
+          'CREATE INDEX IF NOT EXISTS speech_metadata_projection ON speech_metadata(source_id,fetched_at)',
+          'CREATE INDEX IF NOT EXISTS speech_catalog_projection ON speech_catalog(source_id,fetched_at)',
+          'CREATE INDEX IF NOT EXISTS speech_catalog_latest ON speech_catalog(date DESC) WHERE kind IN (\'PLENARY_DEBATE_SPEECH\',\'PLENARY_DEBATE_WRITTEN_STATEMENT\')',
+        ])this.db.exec(sql);
+        this.db.exec(`CREATE TRIGGER IF NOT EXISTS speech_metadata_catalog_insert AFTER INSERT ON speech_metadata BEGIN
+          INSERT OR IGNORE INTO speech_catalog_dirty VALUES (NEW.source_id); END;
+          CREATE TRIGGER IF NOT EXISTS speech_metadata_catalog_update AFTER UPDATE OF fetched_at ON speech_metadata BEGIN
+          INSERT OR IGNORE INTO speech_catalog_dirty VALUES (NEW.source_id); END;
+          CREATE TRIGGER IF NOT EXISTS speech_catalog_clean_insert AFTER INSERT ON speech_catalog BEGIN
+          DELETE FROM speech_catalog_dirty WHERE source_id=NEW.source_id AND EXISTS(SELECT 1 FROM speech_metadata WHERE source_id=NEW.source_id AND fetched_at IS NEW.fetched_at); END;
+          CREATE TRIGGER IF NOT EXISTS speech_catalog_clean_update AFTER UPDATE OF fetched_at ON speech_catalog BEGIN
+          DELETE FROM speech_catalog_dirty WHERE source_id=NEW.source_id AND EXISTS(SELECT 1 FROM speech_metadata WHERE source_id=NEW.source_id AND fetched_at IS NEW.fetched_at);
+          INSERT OR IGNORE INTO speech_catalog_dirty SELECT NEW.source_id WHERE EXISTS(SELECT 1 FROM speech_metadata WHERE source_id=NEW.source_id AND fetched_at IS NOT NEW.fetched_at); END;
+          CREATE TRIGGER IF NOT EXISTS speech_catalog_dirty_delete AFTER DELETE ON speech_catalog BEGIN
+          INSERT OR IGNORE INTO speech_catalog_dirty SELECT OLD.source_id WHERE EXISTS(SELECT 1 FROM speech_metadata WHERE source_id=OLD.source_id); END;
+          CREATE TRIGGER IF NOT EXISTS speech_metadata_catalog_delete AFTER DELETE ON speech_metadata BEGIN
+          DELETE FROM speech_catalog_dirty WHERE source_id=OLD.source_id; END;`);
+        this.db.exec(`INSERT OR IGNORE INTO speech_catalog_dirty SELECT m.source_id FROM speech_metadata m
+          LEFT JOIN speech_catalog c ON c.source_id=m.source_id WHERE c.source_id IS NULL OR c.fetched_at IS NOT m.fetched_at`);
+        this.set('resourceIndexes',1);initialized=true;
+      }
+      if(this.get('speechMemberIndex')!==2) {
+        this.db.exec(`DROP TRIGGER IF EXISTS speech_member_insert; DROP TRIGGER IF EXISTS speech_member_update; DROP TRIGGER IF EXISTS speech_member_delete;
+          DROP TABLE IF EXISTS speech_member_catalog;
+          CREATE TABLE speech_member_catalog (
+          member TEXT NOT NULL,source_id TEXT NOT NULL,date TEXT,kind TEXT,start TEXT,numbering INTEGER,revision INTEGER NOT NULL,order_ms INTEGER,source_order INTEGER NOT NULL,
+          PRIMARY KEY(member,source_id));
+          CREATE INDEX speech_member_page ON speech_member_catalog(member,date,start,numbering,source_id,kind,revision);
+          CREATE INDEX speech_member_list ON speech_member_catalog(member,order_ms DESC,source_order ASC,date,kind,revision,source_id);
+          CREATE INDEX speech_member_source ON speech_member_catalog(source_id);
+          CREATE TRIGGER speech_member_insert AFTER INSERT ON speech_catalog BEGIN
+            DELETE FROM speech_member_catalog WHERE source_id=NEW.source_id;
+            INSERT OR IGNORE INTO speech_member_catalog SELECT value,NEW.source_id,NEW.date,NEW.kind,NEW.start,NEW.numbering,NEW.revision,speech_order_ms(NEW.start,NEW.date),NEW.rowid FROM json_each(NEW.participants); END;
+          CREATE TRIGGER speech_member_update AFTER UPDATE ON speech_catalog BEGIN
+            DELETE FROM speech_member_catalog WHERE source_id=OLD.source_id;
+            INSERT OR IGNORE INTO speech_member_catalog SELECT value,NEW.source_id,NEW.date,NEW.kind,NEW.start,NEW.numbering,NEW.revision,speech_order_ms(NEW.start,NEW.date),NEW.rowid FROM json_each(NEW.participants); END;
+          CREATE TRIGGER speech_member_delete AFTER DELETE ON speech_catalog BEGIN
+            DELETE FROM speech_member_catalog WHERE source_id=OLD.source_id; END;
+          INSERT OR IGNORE INTO speech_member_catalog SELECT p.value,c.source_id,c.date,c.kind,c.start,c.numbering,c.revision,speech_order_ms(c.start,c.date),c.rowid
+            FROM speech_catalog c,json_each(c.participants) p;`);
+        this.set('speechMemberIndex',2);initialized=true;
+      }
+      if(this.get('questionDiscoveryVersion')!==1) {
+        this.db.exec('CREATE TABLE IF NOT EXISTS question_discovery (source_key TEXT PRIMARY KEY,signature TEXT NOT NULL,policy TEXT NOT NULL)');
+        this.set('questionDiscoveryVersion',1);initialized=true;
+      }
+      if(this.get('weekCloudSchema')!==3){prepareWeekClouds(this.db);this.set('weekCloudSchema',3);initialized=true;}
+      // The writer reservation prevents takeover even if initialization exceeds
+      // its original TTL. Renew ownership before publishing the transaction.
+      if(this.db.prepare('UPDATE lease SET expires=? WHERE id=1 AND owner=?').run(this.clock()+ttl,this.owner).changes!==1)throw new Error('Corpus writer lease was lost.');
+      return true;
+    });
+    if(acquired&&initialized)this.db.exec('PRAGMA main.wal_checkpoint(TRUNCATE)');
+    return acquired;
+  }
+  renew(ttl=90_000){return this.db.prepare('UPDATE lease SET expires=? WHERE id=1 AND owner=? AND expires>?').run(this.clock()+ttl,this.owner,this.clock()).changes===1;}
+  assertWriter() {
+    const lease=this.db.prepare('SELECT owner,expires FROM lease WHERE id=1').get();
+    if(lease?.owner!==this.owner || lease.expires<=this.clock())throw new Error('Corpus writer lease was lost.');
+  }
+  release(){this.db.prepare('DELETE FROM lease WHERE id=1 AND owner=?').run(this.owner);}
+
+  // Serving generation of the attached activity index, or null before its first
+  // load. `published` is false while only an initial partial generation exists.
+  indexState() {
+    if(!this.attachIndex())return {generation:null,published:false};
+    const value=key=>parse(this.db.prepare('SELECT value FROM idx.meta WHERE key=?').get(key)?.value);
+    const active=value('active');
+    return {generation:active || value('working')?.generation || null,published:Boolean(active)};
+  }
+  indexGeneration(){return this.indexState().generation;}
+  enqueue(key,kind,body,priority) {
+    this.assertWriter();
+    return this.db.prepare('INSERT OR IGNORE INTO tasks(key,kind,body,priority) VALUES (?,?,?,?)').run(key,kind,JSON.stringify(body),priority).changes===1;
+  }
+  reopen(key,body,priority) {
+    this.assertWriter();
+    const failure=this.db.prepare('SELECT * FROM source_failures WHERE key=?').get(key);
+    if(failure&&failure.descriptor===sourceDescriptor(body)&&failure.parser_version===DOCX_EXTRACTION_VERSION)return;
+    this.db.prepare('DELETE FROM source_failures WHERE key=?').run(key);
+    this.db.prepare('UPDATE tasks SET done=0,attempts=0,error=NULL,retry_at=0,body=?,priority=? WHERE key=? AND done=1').run(JSON.stringify(body),priority,key);
+  }
+  resetTask(key,body,priority) {
+    this.assertWriter();
+    this.db.prepare('DELETE FROM source_failures WHERE key=?').run(key);
+    this.db.prepare('UPDATE tasks SET done=0,done_at=NULL,attempts=0,error=NULL,retry_at=0,body=?,priority=? WHERE key=?').run(JSON.stringify(body),priority,key);
+  }
+  task(key){const row=this.db.prepare('SELECT * FROM tasks WHERE key=?').get(key);return row && {...row,body:parse(row.body)};}
+  recheckSourceFailures() {
+    this.assertWriter();
+    for(const row of this.db.prepare('SELECT key FROM source_failures WHERE parser_version<? LIMIT 10').all(DOCX_EXTRACTION_VERSION)) {
+      this.db.prepare('UPDATE tasks SET done=0,retry_at=0 WHERE key=?').run(row.key);
+      this.db.prepare('DELETE FROM source_failures WHERE key=?').run(row.key);
+    }
+    for(const row of this.db.prepare('SELECT key FROM source_failures INDEXED BY source_failure_due WHERE next_check IS NOT NULL AND next_check<=? ORDER BY next_check LIMIT 10').all(this.clock())) {
+      this.db.prepare('UPDATE tasks SET done=0,retry_at=0 WHERE key=?').run(row.key);
+      this.db.prepare('UPDATE source_failures SET next_check=NULL WHERE key=?').run(row.key);
+    }
+  }
+  settleSourceFailure(task,error,state='permanent-source-issue') {
+    const settle=()=>{
+      this.assertWriter();
+      if(state==='permanent-source-issue') {
+        const body=this.task(task.key).body;
+        const previous=body.rejectedSource;
+        if(!confirmSourceRejection(previous,error,{descriptor:sourceDescriptor(body),parserVersion:DOCX_EXTRACTION_VERSION,now:this.clock(),observe:false}).confirmed)return;
+      }
+      this.db.prepare('INSERT OR REPLACE INTO source_failures VALUES (?,?,?,?,?,?,?)').run(task.key,state,String(error.message).slice(0,350),sourceDescriptor(task.body),error.sourceHash??null,DOCX_EXTRACTION_VERSION,state==='satisfied-by-alternative'?null:this.clock()+SOURCE_RECHECK_MS);
+      this.db.prepare('UPDATE tasks SET done=1,done_at=?,error=?,attempts=attempts+1 WHERE key=?').run(this.clock(),String(error.message).slice(0,350),task.key);
+    };
+    return this.db.isTransaction?settle():this.transaction(settle);
+  }
+  hasDueTask(){return Boolean(this.db.prepare('SELECT 1 FROM source_failures WHERE parser_version<? LIMIT 1').get(DOCX_EXTRACTION_VERSION))||Boolean(this.db.prepare('SELECT 1 FROM source_failures INDEXED BY source_failure_due WHERE next_check IS NOT NULL AND next_check<=? LIMIT 1').get(this.clock()))||Boolean(this.db.prepare('SELECT 1 FROM tasks INDEXED BY task_pending_due WHERE done=0 AND retry_at<=? LIMIT 1').get(this.clock()));}
+  nextTask(){if(!this.hasDueTask())return;this.recheckSourceFailures();const row=this.db.prepare('SELECT * FROM tasks INDEXED BY task_pending_order WHERE done=0 AND retry_at<=? ORDER BY priority DESC,key DESC LIMIT 1').get(this.clock());return row && {...row,body:parse(row.body)};}
+  taskProgress(task,body){this.assertWriter();this.db.prepare('UPDATE tasks SET body=?,attempts=0,error=NULL,retry_at=0 WHERE key=?').run(JSON.stringify(body),task.key);}
+  finishTask(task){const finish=()=>{this.assertWriter();this.db.prepare('DELETE FROM source_failures WHERE key=?').run(task.key);this.db.prepare('UPDATE tasks SET done=1,done_at=?,error=NULL WHERE key=?').run(this.clock(),task.key);observeCheck(this,task.body?.availabilityCheck);};return this.db.isTransaction?finish():this.transaction(finish);}
+  failTask(task,error,retryAfter=0) {
+    this.assertWriter();
+    const body=this.task(task.key).body,previous=body.rejectedSource;
+    const {rejection,confirmed}=confirmSourceRejection(previous,error,{descriptor:sourceDescriptor(body),parserVersion:DOCX_EXTRACTION_VERSION,now:this.clock()});
+    if(rejection)body.rejectedSource=rejection;else delete body.rejectedSource;
+    this.db.prepare('UPDATE tasks SET body=? WHERE key=?').run(JSON.stringify(body),task.key);
+    if(confirmed&&!body.pdfPending)return this.settleSourceFailure(task,error);
+    const delay=Math.max(retryAfter*1000,Number(error.retryAfter || 0)*1000,sourceMissing(error)?missingSourceDelay(task.attempts):transientSourceDelay(task.attempts));
+    this.db.prepare('UPDATE tasks SET attempts=attempts+1,retry_at=?,error=? WHERE key=?').run(this.clock()+delay,String(error.message).slice(0,350),task.key);
+  }
+  hasText(sourceUrl){return Boolean(this.db.prepare('SELECT 1 FROM texts WHERE source_url=? LIMIT 1').get(sourceUrl));}
+
+  // One source record and the texts supplied with it. Unchanged texts keep their
+  // row (and FTS entry); only the confirmation time moves forward.
+  putDocument(document,texts,{acquisition='unknown'}={}) {
+    if(!KINDS.includes(document.kind) || !/^[A-Z0-9-]{1,100}$/.test(document.sourceId))throw new Error('Invalid corpus document.');
+    const write=()=>{
+      this.assertWriter();
+      this.db.prepare(`INSERT INTO documents(source_id,kind,parent_id,date,term,original_languages) VALUES (?,?,?,?,?,?)
+        ON CONFLICT(source_id) DO UPDATE SET kind=excluded.kind,parent_id=excluded.parent_id,date=COALESCE(excluded.date,date),term=COALESCE(excluded.term,term),original_languages=excluded.original_languages`)
+        .run(document.sourceId,document.kind,document.parentId||null,document.date||null,document.term??null,JSON.stringify(document.originalLanguages||[]));
+      const id=this.db.prepare('SELECT id FROM documents WHERE source_id=?').get(document.sourceId).id;
+      // A real API text replaces every website-imported variant of this speech.
+      if(document.kind==='speech'&&texts.length&&texts.every(text=>text.sourceEdition?.acquisition!=='website-xml'))
+        this.db.prepare("DELETE FROM texts WHERE document_id=? AND json_extract(source_edition,'$.acquisition')='website-xml'").run(id);
+      const existing=this.db.prepare('SELECT id,sha256 FROM texts WHERE document_id=? AND source_key=?');
+      const insert=this.db.prepare(`INSERT INTO texts(document_id,language,source_key,translation_type,source_format,source_url,fetched_at,checked_at,sha256,chars,body,raw,source_edition) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      const update=this.db.prepare(`UPDATE texts SET language=?,translation_type=?,source_format=?,source_url=?,fetched_at=?,checked_at=?,sha256=?,chars=?,body=?,raw=?,source_edition=? WHERE id=?`);
+      // Same text from a replacement file: keep the body and its FTS entry, update the link.
+      const confirm=this.db.prepare('UPDATE texts SET checked_at=?,translation_type=?,language=?,source_format=?,source_url=?,source_edition=? WHERE id=?');
+      for(const text of texts) {
+        const hash=sha((text.raw ?? text.body)), old=existing.get(id,text.sourceKey);
+        observeSource(this,{sourceId:document.sourceId,family:document.kind==='speech'?'speeches':document.kind==='answer'?'answers':'questions',stage:'text',language:text.language,variant:text.sourceKey,date:document.date,fetchedAt:text.fetchedAt,url:text.sourceUrl,acquisition,existed:Boolean(old)});
+        if(old?.sha256===hash){confirm.run(text.fetchedAt,text.translationType,text.language,text.sourceFormat,text.sourceUrl,text.sourceEdition==null?null:JSON.stringify(text.sourceEdition),old.id);continue;}
+        const raw=text.raw==null?null:zstdCompressSync(Buffer.from(text.raw));
+        const values=[text.language,text.translationType,text.sourceFormat,text.sourceUrl,text.fetchedAt,text.fetchedAt,hash,text.body.length,text.body,raw,text.sourceEdition==null?null:JSON.stringify(text.sourceEdition)];
+        if(old)update.run(...values,old.id);
+        else insert.run(id,text.language,text.sourceKey,text.translationType,text.sourceFormat,text.sourceUrl,text.fetchedAt,text.fetchedAt,hash,text.body.length,text.body,raw,text.sourceEdition==null?null:JSON.stringify(text.sourceEdition));
+      }
+      if(document.kind==='speech')this.db.prepare('UPDATE speech_catalog SET revision=? WHERE source_id=?').run(this.nextSpeechRevision(),document.sourceId);
+      finishAvailabilityWrite(this);
+    };
+    return this.db.isTransaction?write():this.transaction(write);
+  }
+  // Speech text imported from a website XML file, not from the API.
+  websiteSpeechHeld(sourceId) {
+    return Boolean(this.db.prepare("SELECT 1 FROM documents d JOIN texts t ON t.document_id=d.id WHERE d.source_id=? AND json_extract(t.source_edition,'$.acquisition')='website-xml' LIMIT 1").get(sourceId));
+  }
+  raw(sourceId,sourceKey) {
+    const row=this.db.prepare('SELECT t.raw FROM texts t JOIN documents d ON d.id=t.document_id WHERE d.source_id=? AND t.source_key=?').get(sourceId,sourceKey);
+    return row?.raw ? zstdDecompressSync(row.raw).toString('utf8') : null;
+  }
+
+  retainedSpeechFragments(sourceId) {
+    const rows=this.db.prepare(`SELECT t.source_key,t.raw,t.source_url,t.fetched_at,t.sha256 FROM texts t JOIN documents d ON d.id=t.document_id
+      WHERE d.source_id=? AND t.source_format='xml-fragment' AND t.raw IS NOT NULL ORDER BY t.source_key`).all(sourceId);
+    const fragments={};let bytes=0;
+    for(const row of rows) {
+      const xml=zstdDecompressSync(row.raw,{maxOutputLength:2*1024*1024}).toString('utf8');bytes+=Buffer.byteLength(xml);
+      if(bytes>12*1024*1024||sha(xml)!==row.sha256)throw new Error('Retained speech fragments failed projection validation.');
+      fragments[row.source_key]=xml;
+    }
+    return {fragments,headerSources:rows.map(row=>({url:row.source_url,fetchedAt:row.fetched_at}))};
+  }
+
+  putSpeechMetadata(activity,sourceUrl,fetchedAt,{acquisition='unknown'}={}) {
+    this.assertWriter();
+    if(!/^MTG-PL-\d{4}-\d{2}-\d{2}-OTH-\d+$/.test(activity?.activity_id||'')||activity.activity_date!==activity.activity_id.slice(7,17))
+      throw new Error('Invalid speech metadata identity.');
+    const documents=(activity.recorded_in_a_realization_of||[]).map(doc=>{
+      if(!doc||typeof doc!=='object')return doc;
+      const {'api:xmlFragment':fragments,...metadata}=doc;return metadata;
+    });
+    const metadata={...activity,recorded_in_a_realization_of:documents};
+    let previousMetadata=null;
+    const previous=this.db.prepare('SELECT body FROM speech_metadata WHERE source_id=?').get(activity.activity_id);
+    if(previous)try {
+      const saved=JSON.parse(zstdDecompressSync(previous.body,{maxOutputLength:2*1024*1024}));
+      if(saved.version===1&&saved.activity?.activity_id===activity.activity_id&&saved.summary?.id===activity.activity_id&&Array.isArray(saved.speakers))previousMetadata=saved;
+    }catch { /* A fresh projection can replace damaged metadata. */ }
+    const retained=this.retainedSpeechFragments(activity.activity_id);
+    const fragments={...(previousMetadata?.interventionHeaders||{}),...retained.fragments};
+    // Project every supplied header before the text retention policy discards
+    // translations. Older corpora can still project their retained fragments.
+    const supplied=Object.fromEntries(Object.entries(Object.assign({},...(activity.recorded_in_a_realization_of||[]).map(doc=>doc?.['api:xmlFragment']||{})))
+      .filter(([,xml])=>typeof xml==='string'&&Buffer.byteLength(xml)<=2*1024*1024&&!/<!DOCTYPE|<!ENTITY/i.test(xml)&&XMLValidator.validate(xml)===true));
+    Object.assign(fragments,supplied);
+    const metadataOnly=!Object.keys(supplied).length;
+    const headerSources=[...new Map([...retained.headerSources,...(previousMetadata?.headerSources||[]),
+      ...(!metadataOnly?[{url:sourceUrl,fetchedAt:new Date(fetchedAt).toISOString()}]:[])]
+      .map(source=>[source.url+'|'+source.fetchedAt,source])).values()];
+    // The speaker extractor accepts language keys. Add a projection-only alias
+    // for an unambiguous `mul` original; its stored source key remains exact.
+    if(fragments.mul) {
+      const selected=chooseTranscript([{'api:xmlFragment':{mul:fragments.mul}}],'en');
+      if(selected.textLanguage&&selected.textLanguage!=='mul'&&!fragments[selected.textLanguage])fragments[selected.textLanguage]=fragments.mul;
+      // A metadata-only refresh keeps the retained original as the preferred
+      // name source while preserving compact translated name/role variants.
+      if(metadataOnly&&selected.textLanguage&&selected.textLanguage!=='mul') {
+        const ordered={[selected.textLanguage]:fragments[selected.textLanguage],...fragments};
+        for(const key of Object.keys(fragments))delete fragments[key];
+        Object.assign(fragments,ordered);
+      }
+    }
+    const docs=structuredClone(documents),first=docs.find(doc=>doc&&typeof doc==='object');
+    if(first)first['api:xmlFragment']=fragments;
+    const observed={...activity,recorded_in_a_realization_of:docs};
+    const people=speechSpeakerDetails(observed);
+    if(metadataOnly&&previousMetadata) {
+      const ids=new Set(speechPeople(activity));
+      for(const old of previousMetadata.speakers.filter(person=>ids.has(person.id))) {
+        const current=people.find(person=>person.id===old.id);
+        if(!current){people.push(old);continue;}
+        current.nameVariants=[...new Map([...(old.nameVariants||[]),...(current.nameVariants||[])].map(variant=>[JSON.stringify(variant),variant])).values()];
+        current.roleLabels={...old.roleLabels,...current.roleLabels};
+      }
+    }
+    // Availability describes observed source variants, independently of the
+    // retention policy. Metadata-only refreshes must not forget known variants.
+    const previousLanguages=Array.isArray(previousMetadata?.availableTextLanguages)?previousMetadata.availableTextLanguages.filter(value=>typeof value==='string'):[];
+    const availableTextLanguages=[...new Set([...chooseTranscript(activity.recorded_in_a_realization_of||[],'en').availableTextLanguages,...previousLanguages,...chooseTranscript(docs,'en').availableTextLanguages])];
+    const summary=speechSummary(observed),previousIntervention=previousMetadata?.summary?.intervention;
+    // Legacy rows may predate compact headers and retain no body at all. Their
+    // ID-checked header remains useful, but current API relationships take precedence.
+    if(metadataOnly&&!summary.intervention.headerAvailable&&previousIntervention?.headerAvailable&&
+      speechPeople(activity).includes(previousIntervention.speaker?.id)) {
+      for(const key of ['type','process','speaker','headerAvailable','evidence'])summary.intervention[key]=previousIntervention[key];
+    }
+    const body=JSON.stringify({version:1,activity:metadata,summary,speakers:people,headerSources,availableTextLanguages,
+      interventionHeaders:interventionHeaders(fragments),
+      interventionHeaderSources:{...(previousMetadata?.interventionHeaderSources||{}),...Object.fromEntries(Object.keys(supplied).map(key=>[key,{url:sourceUrl,fetchedAt:new Date(fetchedAt).toISOString()}]))},
+      interventionClassificationVersion:INTERVENTION_CLASSIFICATION_VERSION});
+    if(Buffer.byteLength(body)>2*1024*1024)throw new Error('Speech metadata exceeded the allowed size.');
+    const write=()=>{
+      this.assertWriter();
+      const updated=this.db.prepare(`INSERT INTO speech_metadata VALUES (?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET
+        body=excluded.body,source_url=excluded.source_url,fetched_at=excluded.fetched_at WHERE excluded.fetched_at>=speech_metadata.fetched_at`)
+        .run(activity.activity_id,zstdCompressSync(Buffer.from(body)),sourceUrl,new Date(fetchedAt).toISOString());
+      if(updated.changes){
+        this.projectSpeechCatalog(activity,availableTextLanguages);
+        observeSource(this,{sourceId:activity.activity_id,family:'speeches',subtype:summary.kind,date:activity.activity_date,fetchedAt,url:sourceUrl,acquisition,existed:Boolean(previous)});
+        for(const language of Object.keys(supplied))observeSource(this,{sourceId:activity.activity_id,family:'speeches',subtype:summary.kind,stage:'language-metadata',language,variant:language,date:activity.activity_date,fetchedAt,url:sourceUrl,acquisition,existed:Boolean(previousMetadata?.availableTextLanguages?.includes(language))});
+        finishAvailabilityWrite(this);
+      }
+    };
+    return this.db.isTransaction?write():this.transaction(write);
+  }
+
+  refreshSpeechInterventions(task,{limit=100,maxDuration=1000}={}) {
+    this.assertWriter();
+    if(!Number.isSafeInteger(limit)||limit<1||limit>100)throw new Error('Invalid speech classification refresh limit.');
+    if(!Number.isFinite(maxDuration)||maxDuration<=0||maxDuration>10_000)throw new Error('Invalid speech classification refresh duration.');
+    const current=this.task(task.key);
+    if(!current||current.done||current.kind!=='speech-intervention-refresh')throw new Error('Invalid speech classification refresh task.');
+    if(current.body.version!==INTERVENTION_CLASSIFICATION_VERSION) {
+      this.finishTask(current);return;
+    }
+    const afterId=current.body.afterId||'';
+    if(afterId&&!/^MTG-PL-\d{4}-\d{2}-\d{2}-OTH-\d+$/.test(afterId))throw new Error('Invalid speech classification refresh cursor.');
+    const rows=this.db.prepare('SELECT source_id FROM speech_metadata WHERE source_id>? ORDER BY source_id LIMIT ?').all(afterId,limit);
+    const updates=[],deadline=performance.now()+maxDuration;let processed=0,lastId=afterId;
+    for(const row of rows) {
+      const {sourceUrl,fetchedAt,...saved}=this.speechMetadata(row.source_id);
+      if(saved.interventionClassificationVersion!==INTERVENTION_CLASSIFICATION_VERSION&&['unclassified','blue-card'].includes(saved.summary.intervention.type)) {
+        const {fragments:raw}=this.retainedSpeechFragments(row.source_id);
+        const fragments={...(saved.interventionHeaders||{}),...raw};
+        const docs=structuredClone(saved.activity.recorded_in_a_realization_of||[]),first=docs.find(doc=>doc&&typeof doc==='object');
+        if(first)first['api:xmlFragment']=fragments;
+        const classified=interventionMetadata({...saved.activity,recorded_in_a_realization_of:docs});
+        const before=saved.summary.intervention,next={...before};
+        if(!['unclassified','blue-card'].includes(classified.type)) {
+          for(const key of ['type','process','evidence'])next[key]=classified[key];
+          if(Object.hasOwn(classified,'classificationSources'))next.classificationSources=classified.classificationSources;
+          else delete next.classificationSources;
+        }
+        const body=JSON.stringify({...saved,summary:{...saved.summary,intervention:next},
+          interventionHeaders:interventionHeaders(fragments),interventionClassificationVersion:INTERVENTION_CLASSIFICATION_VERSION});
+        if(Buffer.byteLength(body)>2*1024*1024)throw new Error('Speech metadata exceeded the allowed size.');
+        updates.push({id:row.source_id,body:zstdCompressSync(Buffer.from(body)),changed:JSON.stringify(next)!==JSON.stringify(before)});
+      }
+      processed++;lastId=row.source_id;
+      if(performance.now()>=deadline)break;
+    }
+    // The projection, page-walk revision and durable cursor move together. A
+    // corrupt fragment leaves the task pending, with its ordinary visible retry.
+    this.transaction(()=>{
+      this.assertWriter();
+      for(const update of updates) {
+        this.db.prepare('UPDATE speech_metadata SET body=? WHERE source_id=?').run(update.body,update.id);
+        if(update.changed)this.db.prepare('UPDATE speech_catalog SET revision=? WHERE source_id=?').run(this.nextSpeechRevision(),update.id);
+      }
+      if(rows.length===limit||processed<rows.length)this.taskProgress(current,{...current.body,afterId:lastId});
+      else {
+        this.set('speechInterventionClassificationVersion',INTERVENTION_CLASSIFICATION_VERSION);
+        this.finishTask(current);
+      }
+    });
+  }
+
+  nextSpeechRevision() {
+    this.assertWriter();const revision=(this.get('speechReadRevision')||0)+1;this.set('speechReadRevision',revision);return revision;
+  }
+  projectSpeechCatalog(activity,availableLanguages=[]) {
+    const project=()=>{
+      this.assertWriter();
+      // Keep the observed catalogue insertion order on refresh. orderedSpeeches
+      // is a stable timestamp sort over hits (or data when hits are absent).
+      this.db.prepare('INSERT INTO speech_catalog VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET date=excluded.date,kind=excluded.kind,start=excluded.start,numbering=excluded.numbering,participants=excluded.participants,available_languages=excluded.available_languages,revision=excluded.revision,fetched_at=excluded.fetched_at').run(activity.activity_id,activity.activity_date||null,
+        String(activity.had_activity_type||'').split('/').at(-1),activity.activity_start_date||null,
+        (activity.recorded_in_a_realization_of||[]).find(doc=>Number.isSafeInteger(doc?.numbering))?.numbering??null,JSON.stringify(speechPeople(activity)),JSON.stringify(availableLanguages),
+        this.nextSpeechRevision(),this.db.prepare('SELECT fetched_at FROM speech_metadata WHERE source_id=?').get(activity.activity_id)?.fetched_at||null);
+    };
+    // Background repair and ordinary metadata writes publish one coherent revision.
+    return this.db.isTransaction?project():this.transaction(project);
+  }
+  speechMetadata(sourceId) {
+    if(!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='speech_metadata'").get())return null;
+    const row=this.db.prepare('SELECT * FROM speech_metadata WHERE source_id=?').get(sourceId);
+    if(!row)return null;
+    const saved=JSON.parse(zstdDecompressSync(row.body,{maxOutputLength:2*1024*1024}));
+    if(saved.version!==1||saved.activity?.activity_id!==sourceId||saved.summary?.id!==sourceId||saved.activity.activity_date!==sourceId.slice(7,17)||saved.summary.date!==saved.activity.activity_date||
+      saved.summary.kind!==String(saved.activity.had_activity_type||'').split('/').at(-1)||!Array.isArray(saved.speakers)||!saved.summary.intervention||
+      !Array.isArray(saved.summary.intervention.parentIds)||!Array.isArray(saved.summary.intervention.onBehalfOf))throw new Error('Retained speech metadata identity mismatch.');
+    return {...saved,sourceUrl:row.source_url,fetchedAt:row.fetched_at};
+  }
+  // Optional read-time enrichment; never fetch or write history from a page read.
+  speechRoleTranslations(metadata,language='en',budget={remaining:8}) {
+    language ||= 'en';
+    if(!metadata||!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='speech_catalog'").get())return metadata;
+    const historyComplete=this.get('resourceIndexes')===1&&!this.db.prepare('SELECT 1 FROM speech_catalog_dirty LIMIT 1').get()&&
+      !this.db.prepare('SELECT 1 FROM speech_catalog WHERE kind IS NULL LIMIT 1').get();
+    const speakers=metadata.speakers.map(person=>{
+      if(!historyComplete||person.sittingRole==='chair'||person.role==='Chairing the sitting'||!Object.keys(person.roleLabels||{}).length)return person;
+      const missing=[...new Set([language,'en'])].filter(lang=>!speakerRoleLabel(person,lang));
+      if(!missing.length||budget.remaining--<=0)return person;
+      // Bound index traversal as well as returned matches. A cut through a day
+      // cannot establish that day's nearest role, so withhold reuse at the edge.
+      budget.history??=new Map();
+      const day=metadata.summary.date;
+      if(!budget.history.has(day))budget.history.set(day,this.db.prepare(`SELECT source_id,date,start,participants
+        FROM speech_catalog INDEXED BY speech_catalog_latest
+        WHERE kind IN ('PLENARY_DEBATE_SPEECH','PLENARY_DEBATE_WRITTEN_STATEMENT') AND date<=?
+        ORDER BY date DESC LIMIT 513`).all(day));
+      const rows=budget.history.get(day),currentStart=Date.parse(metadata.summary.start);
+      const candidates=rows.slice(0,512).filter(row=>row.source_id!==metadata.summary.id&&JSON.parse(row.participants).includes(person.id)&&
+        (row.date<day||!Number.isFinite(currentStart)||!Number.isFinite(Date.parse(row.start))||Date.parse(row.start)<=currentStart))
+        .toSorted((a,b)=>b.date.localeCompare(a.date)||Number(!Number.isFinite(Date.parse(b.start)))-Number(!Number.isFinite(Date.parse(a.start)))||
+          (Date.parse(b.start)||0)-(Date.parse(a.start)||0)||a.source_id.localeCompare(b.source_id));
+      const [prior,other]=candidates;
+      if(!prior)return person;
+      if(rows.length>512&&prior.date<=rows[511].date)return person;
+      if(other?.date===prior.date&&(!Number.isFinite(Date.parse(prior.start))||!Number.isFinite(Date.parse(other.start))||Date.parse(prior.start)===Date.parse(other.start)))return person;
+      let previous;try{previous=this.speechMetadata(prior.source_id);}catch{return person;}
+      if(!previous)return person;
+      let result=person;
+      for(const lang of missing) {
+        const label=reuseSpeechRole(metadata,person,previous,lang);
+        if(label)result={...result,roleLabels:{...result.roleLabels,[lang]:label}};
+      }
+      return result;
+    });
+    const evidenceRevision=this.get('speechReadRevision');
+    return {...metadata,speakers:speakers.map(person=>({...person,roleSource:{speechId:metadata.summary.id,date:metadata.summary.date,
+      url:metadata.sourceUrl,fetchedAt:metadata.fetchedAt,historyComplete,...(Number.isSafeInteger(evidenceRevision)?{evidenceRevision}:{})}}))};
+  }
+  weekCloud(params){return this.snapshot(()=>readWeekCloud(this,params));}
+  speechData(params){return this.snapshot(()=>this.speechDataSnapshot(params));}
+  speechDataSnapshot({sourceIds,language=null,metadataOnly=false,websiteSitting=null}) {
+    if(!Array.isArray(sourceIds)||sourceIds.length>100||sourceIds.some(id=>!/^MTG-PL-\d{4}-\d{2}-\d{2}-[A-Z0-9-]+$/.test(id)))throw new Error('Invalid retained speech selection.');
+    // An imported speech can be missing from its debate's own child list, so a sitting also names its imports.
+    if(websiteSitting!==null) {
+      if(!/^\d{4}-\d{2}-\d{2}$/.test(websiteSitting))throw new Error('Invalid retained speech selection.');
+      const prefix='MTG-PL-'+websiteSitting+'-';
+      sourceIds=[...sourceIds,...this.db.prepare("SELECT source_id FROM speech_metadata WHERE source_id>=? AND source_id<? AND source_url GLOB 'https://www.europarl.europa.eu/doceo/*'").all(prefix,prefix+'~').map(row=>row.source_id)];
+    }
+    let bytes=0;const records=[],roleBudget={remaining:8};
+    for(const id of new Set(sourceIds)) {
+      let metadata=null,metadataUnavailable=false;
+      try {metadata=this.speechMetadata(id);}catch {metadataUnavailable=true;}
+      if(metadata)try{metadata=this.speechRoleTranslations(metadata,language,roleBudget);}catch { /* Optional translation evidence must not hide retained metadata. */ }
+      const variants=metadataOnly?[]:this.db.prepare(`SELECT t.id,t.language,t.source_key,t.translation_type,t.source_url,t.fetched_at,t.checked_at,t.chars
+        FROM documents d JOIN texts t ON t.document_id=d.id WHERE d.source_id=? AND d.kind='speech' AND t.source_format='xml-fragment'
+        ORDER BY (t.translation_type='original') DESC,(t.source_key=?) DESC,t.source_key`).all(id,language);
+      const selected=variants.find(row=>row.language===language);
+      let text=null;
+      if(selected&&selected.chars<=2*1024*1024) {
+        const body=this.db.prepare('SELECT body FROM texts WHERE id=?').get(selected.id).body;
+        text={body,language:selected.language,sourceFragmentKey:selected.source_key,translationType:selected.translation_type,
+          sourceUrl:selected.source_url,fetchedAt:selected.fetched_at,checkedAt:selected.checked_at};
+      }
+      const record={id,metadata,metadataUnavailable,text,availableLanguages:[...new Set(variants.filter(row=>row.chars>0&&row.chars<=2*1024*1024).map(row=>row.language))]};
+      const size=Buffer.byteLength(JSON.stringify(record));
+      if(bytes+size>4*1024*1024)return {records,truncated:true};
+      bytes+=size;records.push(record);
+    }
+    return {records,truncated:false};
+  }
+  speechPage(params){return this.snapshot(()=>this.speechPageSnapshot(params));}
+  speechPageSnapshot(params){
+    if(!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='speech_catalog'").get())return null;
+    // A projection is usable only after the existing writer has visited every
+    // retained metadata row. This is not a claim of complete upstream coverage.
+    if(this.get('resourceIndexes')!==1||this.db.prepare('SELECT 1 FROM speech_catalog_dirty LIMIT 1').get())return null;
+    const {member=null,from='2024-07-16',to='9999-12-31',dates=null,kinds=['PLENARY_DEBATE_SPEECH'],sourceIds=null,offset=0,limit=50,descending=false}=params;
+    if(!Number.isSafeInteger(offset)||offset<0||offset>10000||!Number.isSafeInteger(limit)||limit<1||limit>100||
+      !Array.isArray(kinds)||!kinds.length||kinds.some(kind=>!['PLENARY_DEBATE_SPEECH','PLENARY_DEBATE_WRITTEN_STATEMENT'].includes(kind))||
+      sourceIds!==null&&(!Array.isArray(sourceIds)||sourceIds.length>1000))throw new Error('Invalid retained speech page.');
+    const where=['kind IN ('+kinds.map(()=>'?').join(',')+')','date BETWEEN ? AND ?'],args=[...kinds,from,to];
+    if(dates!==null){if(!Array.isArray(dates)||dates.length>5)throw new Error('Invalid retained sitting selection.');where.push('date IN ('+dates.map(()=>'?').join(',')+')');args.push(...dates);}
+    const selectionName=member!==null?'speech_member_catalog':'speech_catalog';
+    const selectionTable=selectionName+(member!==null?' INDEXED BY speech_member_page':'');
+    if(member!==null){where.push('member=?');args.push(String(member));}
+    if(sourceIds!==null){where.push('source_id IN ('+sourceIds.map(()=>'?').join(',')+')');args.push(...sourceIds);}
+    const selection=this.db.prepare('SELECT COUNT(*) n,COALESCE(SUM(revision),0) revision FROM '+selectionTable+' WHERE '+where.join(' AND ')).get(...args);
+    // Pagination follows the selected records. Background availability checks
+    // change the labels below, without changing offsets or speech contents.
+    const total=selection.n,revision=total+':'+selection.revision;
+    if(params.expectedRevision!==undefined&&params.expectedRevision!==revision)return {changed:true};
+    // Continuation pages of a bounded walk can skip the selection-wide coverage
+    // scans below; the walk keeps the evidence read with its first page.
+    const coverage=params.coverage!==false;
+    // Filter the selection before probing retained texts. SQLite can otherwise
+    // run the correlated text lookup for every speech in the date window,
+    // exhausting the reader budget even for a member with only a few speeches.
+    const missingRetainedLanguage=!coverage?null:params.metadataOnly||!params.language?0:this.db.prepare(`WITH selected AS MATERIALIZED (
+      SELECT source_id FROM ${selectionTable} WHERE ${where.join(' AND ')}
+      AND source_id IN (SELECT source_id FROM speech_catalog c WHERE c.source_id=${selectionName}.source_id AND EXISTS (SELECT 1 FROM json_each(c.available_languages) WHERE value=?))
+    ) SELECT COUNT(*) n FROM selected c WHERE NOT EXISTS (
+      SELECT 1 FROM documents d JOIN texts t ON t.document_id=d.id WHERE d.source_id=c.source_id AND t.source_format='xml-fragment' AND t.language=?)`).get(...args,params.language,params.language).n;
+    const direction=descending?'DESC':'ASC';
+    const ids=this.db.prepare(`SELECT source_id FROM ${member!==null&&descending?'speech_member_catalog INDEXED BY speech_member_list':selectionTable} WHERE ${where.join(' AND ')} ORDER BY ${member!==null&&descending?'order_ms DESC,source_order ASC':`date ${direction},start ${direction},numbering ${direction},source_id ${direction}`}  LIMIT ? OFFSET ?`).all(...args,limit,offset).map(row=>row.source_id);
+    const result=this.speechDataSnapshot({...params,sourceIds:ids});
+    const nextOffset=offset+ids.length<total?offset+ids.length:null;
+    if(!coverage)return {...result,total,offset,revision,missingRetainedLanguage,nextOffset,coverage:null};
+    const today=brusselsDay(this.clock());
+    const latestDataDate=this.db.prepare("SELECT MAX(date) date FROM speech_catalog WHERE kind IN ('PLENARY_DEBATE_SPEECH','PLENARY_DEBATE_WRITTEN_STATEMENT') AND date<=?").get(today).date||null;
+    const latestKindDate=this.db.prepare('SELECT MAX(date) date FROM speech_catalog WHERE kind IN ('+kinds.map(()=>'?').join(',')+') AND date<=?').get(...kinds,today).date||null;
+    let availability=null;
+    {
+      // Start at the language index: an absent language is an empty index lookup.
+      const latestTextDate=params.metadataOnly||!params.language?null:this.db.prepare(`SELECT MAX(d.date) date FROM texts t INDEXED BY text_language JOIN documents d ON d.id=t.document_id JOIN speech_catalog c ON c.source_id=d.source_id WHERE t.language=? AND t.source_format='xml-fragment' AND t.chars>0 AND d.kind='speech' AND d.date<=? AND c.kind IN (${kinds.map(()=>'?').join(',')})`).get(params.language,today,...kinds)?.date||null;
+      const pending=Boolean(this.db.prepare("SELECT 1 FROM tasks WHERE done=0 AND kind IN ('speeches','speech','speech-metadata','speech-metadata-detail') LIMIT 1").get());
+      const failed=this.db.prepare("SELECT key,body FROM tasks WHERE done=0 AND error IS NOT NULL AND kind IN ('speeches','speech','speech-metadata','speech-metadata-detail') LIMIT 501").all();
+      const gaps=failed.length>500?[{reason:'source-gap'}]:failed.map(row=>availabilityGap(parse(row.body),row.key));
+      const args={family:'speeches',start:from,end:to>today?today:to,today,gaps,limited:pending,snapshot:{revision:this.get('availabilityRevision')||0},retention:{policy:this.get('speechLanguages')||null,history:historyStatus(this)}};
+      const latestKind=this.db.prepare('SELECT MAX(date) date FROM speech_catalog WHERE kind=? AND date<=?');
+      const dates=new Map(kinds.map(kind=>[kind,latestKind.get(kind,today).date]));
+      availability={metadata:sourceAvailability({...args,sourceKey:'speech-metadata',latestObservedDate:latestKindDate}),metadataSources:kinds.map(kind=>sourceAvailability({...args,sourceKey:kind,subtype:kind,latestObservedDate:dates.get(kind)||null})),text:params.metadataOnly?null:sourceAvailability({...args,sourceKey:'speech-text',subtype:kinds.length===1?kinds[0]:null,stage:'text',language:params.language,latestObservedDate:latestTextDate})};
+    }
+    return {...result,total,offset,revision,missingRetainedLanguage,nextOffset,coverage:{basis:'retained-corpus',authoritativeComplete:false,backfillComplete:Boolean(this.get('backfilledAt')),latestDataDate,availability}};
+  }
+
+  speechTranscript({sourceId,language,allowFallback=false}) {
+    return this.snapshot(()=>{
+      const rows=this.db.prepare(`SELECT t.id,t.language,t.source_key,t.translation_type,t.source_url,t.fetched_at,t.checked_at,t.sha256,t.chars,d.date document_date
+        FROM documents d JOIN texts t ON t.document_id=d.id
+        WHERE d.source_id=? AND d.kind='speech' AND t.source_format='xml-fragment' AND t.raw IS NOT NULL
+        ORDER BY t.source_key`).all(sourceId);
+      // The public retained-only route stays exact. Only the authoritative
+      // detail reader opts into a stored original after its source read fails.
+      const order=languagePreference(rows.map(row=>row.language),language);
+      const row=rows.filter(t=>(allowFallback||t.language===language)&&(!allowFallback||t.chars>0&&t.chars<=2*1024*1024)).sort((a,b)=>
+        Number(b.language===language)-Number(a.language===language) ||
+        Number(b.translation_type==='original')-Number(a.translation_type==='original') ||
+        order.indexOf(a.language)-order.indexOf(b.language) ||
+        Number(b.source_key===language)-Number(a.source_key===language))[0];
+      if(!row)return {id:sourceId,available:false};
+      const raw=this.db.prepare('SELECT raw FROM texts WHERE id=?').get(row.id).raw;
+      const xml=zstdDecompressSync(raw,{maxOutputLength:2*1024*1024}).toString('utf8');
+      if(sha(xml)!==row.sha256)throw new Error('The retained speech transcript failed its checksum.');
+      let metadataRecord=null,metadataUnavailable=false;
+      // Old corpora remain readable before the existing writer adds/backfills metadata.
+      if(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='speech_metadata'").get()) {
+        const metadata=this.db.prepare('SELECT * FROM speech_metadata WHERE source_id=?').get(sourceId);
+        if(metadata) {
+          try {
+            const saved=JSON.parse(zstdDecompressSync(metadata.body,{maxOutputLength:2*1024*1024}).toString('utf8'));
+            if(saved.version!==1||saved.activity?.activity_id!==sourceId||saved.summary?.id!==sourceId||!Array.isArray(saved.speakers))throw new Error('Retained speech metadata identity mismatch.');
+            metadataRecord={...saved,sourceUrl:metadata.source_url,fetchedAt:metadata.fetched_at};
+            try{metadataRecord=this.speechRoleTranslations(metadataRecord,language);}catch { /* Keep the current header when optional history is unavailable. */ }
+          }catch {metadataUnavailable=true;}
+        }
+      }
+      return {id:sourceId,available:true,xml,textLanguage:row.language,sourceFragmentKey:row.source_key,metadataRecord,metadataUnavailable,...(allowFallback?{documentDate:row.document_date}:{}),
+        translationType:row.translation_type,availableTextLanguages:[...new Set(rows.map(t=>t.language))],
+        sourceUrl:row.source_url,fetchedAt:row.fetched_at,checkedAt:row.checked_at};
+    });
+  }
+
+  // Read exactly the variant that produced the excerpt. No upstream request or
+  // language fallback is made, even when another variant exists for this ID.
+  text(params){return this.snapshot(()=>this.textSnapshot(params));}
+  textSnapshot({sourceId,sourceKey,query=null,highlightBytes=CORPUS_LIMITS.highlightBytes,highlightRangeLimit=CORPUS_LIMITS.highlightRanges}) {
+    const row=this.db.prepare(`SELECT d.source_id,d.kind,d.parent_id,d.date,d.original_languages,
+      t.source_key,t.language,t.translation_type,t.source_format,t.source_url,t.fetched_at,t.checked_at,t.sha256,t.body,t.source_edition
+      FROM documents d JOIN texts t ON t.document_id=d.id WHERE d.source_id=? AND t.source_key=?`).get(sourceId,sourceKey);
+    if(!row)return null;
+    const match=query===null?null:corpusQuery(query);
+    const marked=match?this.db.prepare(`SELECT highlight(texts_fts,0,'\u0002','\u0003') AS body FROM texts_fts
+      JOIN texts t ON t.id=texts_fts.rowid JOIN documents d ON d.id=t.document_id WHERE d.source_id=? AND t.source_key=? AND texts_fts MATCH ?`).get(sourceId,sourceKey,match):null;
+    const highlighted=marked?.body??row.body;
+    // Large texts keep one body plus exact UTF-16 match ranges. Duplicating a
+    // multilingual body can otherwise exceed the API response budget.
+    const highlights=query===null?{}:Buffer.byteLength(JSON.stringify(highlighted))<=highlightBytes?{highlightedBody:highlighted}:matchRanges(highlighted,highlightRangeLimit);
+    return {...this.variant(row),originalLanguages:parse(row.original_languages),checkedAt:row.checked_at,sourceVersion:parse(row.source_edition),body:row.body,...highlights};
+  }
+
+  variant(row) {
+    return {sourceId:row.source_id,kind:row.kind,parentId:row.parent_id,date:row.date,sourceKey:row.source_key,
+      language:row.language,translationType:row.translation_type,sourceFormat:row.source_format,sourceUrl:row.source_url,
+      fetchedAt:row.fetched_at,sha256:row.sha256,...(row.snippet===undefined?{}:{snippet:row.snippet})};
+  }
+
+  settledSources() {
+    const summary=state=>({count:this.db.prepare('SELECT COUNT(*) n FROM source_failures WHERE state=?').get(state).n,
+      examples:this.db.prepare('SELECT key,reason,content_hash AS contentHash,parser_version AS parserVersion FROM source_failures WHERE state=? ORDER BY key LIMIT 5').all(state).map(row=>({...row}))});
+    return {sourceIssues:summary('permanent-source-issue'),satisfiedByAlternative:summary('satisfied-by-alternative')};
+  }
+
+  // Cheap coverage for every search response; full counts stay in status().
+  coverage() {
+    const backfilledAt=this.get('backfilledAt');
+    return {version:CORPUS_COVERAGE_VERSION,...this.settledSources(),complete:Boolean(backfilledAt),backfillComplete:Boolean(backfilledAt),authoritativeComplete:false,backfilledAt,phase:this.get('phase')||'waiting',
+      note:backfilledAt?'Initial backfill finished. Results cover stored texts, not an authoritative complete parliamentary corpus.':'Backfilling: counts and search results cover only texts stored so far.',
+      countryBasis:'Current saved roster country of representation; missing countries are not inferred.'};
+  }
+  async diskBytes() {
+    return (await Promise.all(['','-wal','-shm'].map(suffix=>stat(this.filename+suffix).then(s=>s.size).catch(()=>0)))).reduce((a,b)=>a+b,0);
+  }
+  status(params={}){return this.snapshot(()=>this.statusSnapshot(params));}
+  statusSnapshot({diskBytes=null,diskLimit=null}={}) {
+    const documents=Object.fromEntries(this.db.prepare('SELECT kind,COUNT(*) AS n FROM documents GROUP BY kind').all().map(row=>[row.kind,row.n]));
+    // Probe once per document; language variants must not multiply this count.
+    const withText=Object.fromEntries(this.db.prepare('SELECT d.kind,COUNT(*) AS n FROM documents d WHERE EXISTS (SELECT 1 FROM texts t WHERE t.document_id=d.id) GROUP BY d.kind').all().map(row=>[row.kind,row.n]));
+    const texts=this.db.prepare('SELECT d.kind,t.language,COUNT(*) AS n,SUM(t.chars) AS chars FROM texts t JOIN documents d ON d.id=t.document_id GROUP BY d.kind,t.language ORDER BY d.kind,t.language').all();
+    const tasks=this.db.prepare('SELECT kind,COUNT(*) AS total,SUM(done=1) AS done,SUM(done=0 AND error IS NOT NULL) AS retrying FROM tasks GROUP BY kind').all();
+    const settled=this.db.prepare(`SELECT t.kind,f.state,COUNT(*) n,SUM(t.done=1) done FROM source_failures f JOIN tasks t ON t.key=f.key GROUP BY t.kind,f.state`).all();
+    for(const row of tasks) {
+      row.sourceIssues=settled.find(item=>item.kind===row.kind&&item.state==='permanent-source-issue')?.n||0;
+      row.satisfiedByAlternative=settled.find(item=>item.kind===row.kind&&item.state==='satisfied-by-alternative')?.n||0;
+      row.done-=settled.filter(item=>item.kind===row.kind).reduce((sum,item)=>sum+item.done,0);
+    }
+    const lastError=this.db.prepare('SELECT key,error,attempts,retry_at FROM tasks WHERE done=0 AND error IS NOT NULL ORDER BY retry_at DESC LIMIT 1').get();
+    const lease=this.db.prepare('SELECT expires FROM lease WHERE id=1').get();
+    const backfilledAt=this.get('backfilledAt');
+    const metadataRetained=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='speech_metadata'").get()?this.db.prepare('SELECT COUNT(*) n FROM speech_metadata').get().n:0;
+    return {version:CORPUS_STATUS_VERSION,...this.settledSources(),schemaVersion:1,term:10,phase:this.get('phase')||'waiting',complete:Boolean(backfilledAt),backfillComplete:Boolean(backfilledAt),authoritativeComplete:false,backfilledAt,
+      availabilityRevision:this.get('availabilityRevision')||0,availabilityHistory:historyStatus(this),
+      coverage:this.coverage().note,capabilities:{search:true,storedText:true,kinds:KINDS,groups:['document','question'],sorts:['relevance','newest'],sourceIdsLimit:CORPUS_LIMITS.sourceIds},
+      documents:Object.fromEntries(KINDS.map(kind=>[kind,{discovered:documents[kind]||0,withText:withText[kind]||0}])),
+      speechMetadata:{retained:metadataRetained,backfillPending:Boolean(this.get('speechMetadataBackfill'))||tasks.some(task=>task.kind==='speech-metadata-detail'&&task.total>task.done),
+        classificationVersion:this.get('speechInterventionClassificationVersion')??null,
+        classificationRefreshPending:metadataRetained>0&&this.get('speechInterventionClassificationVersion')!==INTERVENTION_CLASSIFICATION_VERSION||tasks.some(task=>task.kind==='speech-intervention-refresh'&&task.total>task.done)},
+      texts:texts.map(row=>({kind:row.kind,language:row.language,count:row.n,characters:row.chars})),
+      tasks:Object.fromEntries(tasks.map(row=>[row.kind,{total:row.total,done:row.done,retrying:row.retrying,sourceIssues:row.sourceIssues,satisfiedByAlternative:row.satisfiedByAlternative}])),
+      lastError:lastError?{key:lastError.key,error:lastError.error,attempts:lastError.attempts,nextRetryAt:new Date(lastError.retry_at).toISOString()}:null,
+      discoveredAt:this.get('discoveredAt'),lastRunAt:this.get('lastRunAt'),languages:{speeches:this.get('speechLanguages')||null,documents:this.get('documentLanguages')||null},
+      diskBytes,diskLimitBytes:diskLimit,indexAttached:this.indexAttached,exclusiveWriterActive:Boolean(lease && lease.expires>this.clock()),
+      dataSource:'European Parliament Open Data API v2 (speech XML fragments; official question and answer DOCX distributions)',attribution:'European Parliament, CC BY 4.0'};
+  }
+
+  // Full-text search with optional joins to the attached activity index.
+  search(params){return this.snapshot(()=>this.searchSnapshot(params));}
+  searchSnapshot({query,kind=null,kinds=null,language=null,uiLanguage='en',member=null,country=null,addressee=null,countryMemberIds=null,countryMetadataIds=null,from=null,to=null,limit=20,offset=0,group='document',dateBasis=group==='question'?'question':'document',sort='relevance',sourceIds=null}) {
+    const match=corpusQuery(query);
+    if(!match)return null;
+    const where=['texts_fts MATCH ?'],params=[match];
+    const selectedKinds=kinds??(kind?[kind]:null);
+    if(selectedKinds){where.push('d.kind IN (SELECT value FROM json_each(?))');params.push(JSON.stringify(selectedKinds));}
+    // SQLite 3.51 can start with every language row and restart MATCH for each.
+    // Disqualify that index term so FTS supplies candidates first. Validated
+    // language strings need no TEXT-affinity coercion removed by unary +.
+    if(language){where.push('+t.language=?');params.push(language);}
+    const generation=this.indexGeneration();
+    const questionId="CASE WHEN d.kind='answer' THEN d.parent_id WHEN d.kind='question' THEN d.source_id END";
+    if(addressee!==null&&generation==null)return {unavailableCode:'corpus_addressee_metadata_unavailable',unavailable:'The activity index is not loaded, so addressee filters are unavailable.'};
+    const recipientQuestion=addressee===null?'NULL':`(SELECT s.body FROM idx.sources s WHERE s.generation=${Number(generation)} AND s.key='/parliamentary-questions/' || ${questionId} AND s.kind='document')`;
+    if(addressee!==null)where.push("d.kind IN ('question','answer')");
+    const groupId=group==='question'?"CASE WHEN d.kind='answer' THEN COALESCE(d.parent_id,d.source_id) ELSE d.source_id END":'d.source_id';
+    const savedQuestionDate=generation==null?'NULL':`(SELECT json_extract(s.body,'$.document_date') FROM idx.sources s WHERE s.generation=${Number(generation)} AND s.key='/parliamentary-questions/' || ${questionId} AND s.kind='document')`;
+    const questionDate=`CASE WHEN d.kind='question' THEN d.date WHEN d.kind='answer' THEN COALESCE(q.date,${savedQuestionDate}) END`;
+    const filterDate=dateBasis==='question'?`CASE WHEN d.kind='speech' THEN d.date ELSE ${questionDate} END`:'d.date';
+    if(from){where.push(addressee!==null?`(${filterDate}>=? OR (${filterDate} IS NULL AND ${recipientQuestion} IS NULL))`:`${filterDate}>=?`);params.push(from);}
+    if(to){where.push(addressee!==null?`(${filterDate}<=? OR (${filterDate} IS NULL AND ${recipientQuestion} IS NULL))`:`${filterDate}<=?`);params.push(to);}
+    if(sourceIds!==null){where.push('d.source_id IN (SELECT value FROM json_each(?))');params.push(JSON.stringify(sourceIds));}
+    if(member || country) {
+      if(generation==null)return {unavailable:'The activity index is not loaded, so member filters are unavailable.'};
+      if(country){
+        const known=new Set(countryMetadataIds||[]),roster=this.db.prepare('SELECT id,body FROM idx.members').all();
+        // Validate coverage independently of the requested country's matches.
+        // The real roster writer stores IDs/names, so missing cached countries
+        // must not turn into successful zeroes. Existing saved countries remain
+        // a fallback only for members without valid cached country metadata.
+        if(!roster.length||roster.some(row=>{const person=parse(row.body);return !known.has(row.id)&&!countryCode(person?.countryCode||person?.['api:country-of-representation']);}))
+          return {unavailableCode:'corpus_country_metadata_unavailable',unavailable:'Saved current-country metadata is incomplete. Retry after the roster metadata becomes available.'};
+      }
+      // Exact identifier joins only: speeches by speaker, questions and answers by author.
+      const authorWhere=['i.generation=?','i.source_id=d.source_id'],authorParams=[generation];
+      if(member){authorWhere.push('i.mep=?');authorParams.push(String(member));}
+      if(country){authorWhere.push(`(i.mep IN (SELECT value FROM json_each(?)) OR (i.mep NOT IN (SELECT value FROM json_each(?)) AND EXISTS (SELECT 1 FROM idx.members m WHERE m.id=i.mep AND CASE COALESCE(json_extract(m.body,'$.countryCode'),json_extract(m.body,'$."api:country-of-representation"')) WHEN 'GR' THEN 'EL' ELSE COALESCE(json_extract(m.body,'$.countryCode'),json_extract(m.body,'$."api:country-of-representation"')) END=?)))`);authorParams.push(JSON.stringify(countryMemberIds||[]),JSON.stringify(countryMetadataIds||[]),country);}
+      where.push(`EXISTS (SELECT 1 FROM idx.items i WHERE ${authorWhere.join(' AND ')})`);params.push(...authorParams);
+    }
+    // Resolve the language from its covering index before matching rowids to
+    // wide text records. Keep FTS ahead of this materialized lookup: reversing
+    // those loops would restart MATCH for every text in the chosen language.
+    const textScope=language?'filtered_text AS MATERIALIZED (SELECT id,document_id,language FROM texts WHERE language=?),':'';
+    const sql=`FROM texts_fts ${language?'CROSS JOIN filtered_text':'JOIN texts'} t ON t.id=texts_fts.rowid JOIN documents d ON d.id=t.document_id LEFT JOIN documents q ON d.kind='answer' AND q.source_id=d.parent_id AND q.kind='question' WHERE ${where.join(' AND ')}`;
+    const order=sort==='newest'?'date DESC,score,group_id':'score,date DESC,group_id';
+    const pageOrder=sort==='newest'?'page.date DESC,page.score,page.group_id':'page.score,page.date DESC,page.group_id';
+    // Count and select groups from one FTS traversal instead of repeating the
+    // same full match for COUNT. The singleton LEFT JOIN retains the true total
+    // for empty and out-of-range pages without a second count query.
+    const recipientColumns=addressee===null?'':`,question_addressee_ids(${recipientQuestion}) AS recipient_ids`;
+    const recipientCondition=addressee==='unavailable'?'json_array_length(recipient_ids)=0':'EXISTS (SELECT 1 FROM json_each(recipient_ids) recipient WHERE recipient.value=?)';
+    const recipientCte=addressee===null?'':`qualified AS MATERIALIZED (SELECT * FROM matched WHERE ${recipientCondition}),`;
+    const matchingSet=addressee===null?'matched':'qualified';
+    const recipientParams=addressee!==null&&addressee!=='unavailable'?[addressee]:[];
+    const gap=addressee===null?'0':'EXISTS (SELECT 1 FROM matched WHERE recipient_ids IS NULL)';
+    const page=this.db.prepare(`WITH ${textScope}matched AS MATERIALIZED (SELECT ${groupId} AS group_id,${filterDate} AS date,texts_fts.rank AS score,t.id AS text_id ${recipientColumns} ${sql}),
+      ${recipientCte}grouped AS MATERIALIZED (SELECT group_id,MIN(score) AS score,MAX(date) AS date FROM ${matchingSet} GROUP BY group_id),
+      page AS MATERIALIZED (SELECT * FROM grouped ORDER BY ${order} LIMIT ? OFFSET ?)
+      SELECT ${gap} AS addressee_gap,(SELECT COUNT(*) FROM grouped) AS total,page.*,matched.text_id,DENSE_RANK() OVER (ORDER BY matched.score) AS hit_rank
+      FROM (SELECT 1) LEFT JOIN page ON 1 LEFT JOIN ${matchingSet} matched ON matched.group_id=page.group_id ORDER BY ${pageOrder}`).all(...(language?[language]:[]),...params,...recipientParams,limit,offset);
+    if(page[0].addressee_gap)return {unavailableCode:'corpus_addressee_metadata_unavailable',unavailable:'Some matching text has no saved parent-question metadata. Addressee filtering is unavailable for this selection.'};
+    const total=page[0].total,selected=[...new Map(page.filter(row=>row.group_id!==null).map(row=>[row.group_id,row])).values()];
+    // Keep exact matching variants from the same snapshot. Integer score ranks
+    // preserve ties without serializing floating-point scores into JSON.
+    const selectedHits=page.filter(row=>row.text_id!==null).map(row=>[row.text_id,row.hit_rank]);
+    const members=generation==null?null:this.db.prepare('SELECT DISTINCT mep FROM idx.items WHERE generation=? AND source_id=? ORDER BY mep');
+    const memberIds=id=>members?members.all(generation,id).map(item=>Number(item.mep)):null;
+    const person=generation==null?null:this.db.prepare('SELECT body FROM idx.members WHERE id=?');
+    const people=(ids,kind)=>(ids||[]).map(id=>({id,name:parse(person?.get(String(id))?.body)?.name||null,role:kind==='speech'?'SPEAKER':kind==='answer'?'QUESTION_AUTHOR':'AUTHOR'}));
+    const rows=selected.length?this.db.prepare(`SELECT ${groupId} AS group_id,d.source_id,d.kind,d.parent_id,d.date,${questionDate} AS question_date,
+      t.source_key,t.sha256,t.language,t.translation_type,t.source_format,t.source_url,t.fetched_at,
+      snippet(texts_fts,0,'\u0002','\u0003','…',24) AS snippet
+      FROM json_each(?) AS selected_hit CROSS JOIN texts_fts ON texts_fts.rowid=json_extract(selected_hit.value,'$[0]')
+      JOIN texts t ON t.id=texts_fts.rowid JOIN documents d ON d.id=t.document_id
+      LEFT JOIN documents q ON d.kind='answer' AND q.source_id=d.parent_id AND q.kind='question'
+      WHERE texts_fts MATCH ? ORDER BY json_extract(selected_hit.value,'$[1]'),d.source_id,t.language,t.source_key`).all(JSON.stringify(selectedHits),match):[];
+    const byGroup=new Map(selected.map(row=>[row.group_id,[]]));
+    for(const row of rows)byGroup.get(row.group_id).push(row);
+    const metadata=generation==null?null:this.db.prepare('SELECT body FROM idx.items WHERE generation=? AND source_id=? ORDER BY mep,category LIMIT 1');
+    const savedQuestion=generation==null?null:this.db.prepare("SELECT body FROM idx.sources WHERE generation=? AND key=? AND kind='document'");
+    const localTitle=titles=>typeof titles==='string'?titles:titles?.[languagePreference(Object.keys(titles||{}).filter(code=>typeof titles[code]==='string'&&titles[code].trim()),uiLanguage)[0]]||null;
+    const results=selected.map(selectedRow=>{
+      const matched=byGroup.get(selectedRow.group_id),first=matched[0],sourceId=selectedRow.group_id;
+      const questionGroup=group==='question' && (first.kind==='question'||first.kind==='answer'&&first.parent_id);
+      const item=parse(metadata?.get(generation,sourceId)?.body);
+      const questionSourceId=questionGroup||first.kind==='question'?sourceId:first.kind==='answer'?first.parent_id:null;
+      const saved=questionSourceId?parse(savedQuestion?.get(generation,'/parliamentary-questions/'+questionSourceId)?.body):null;
+      const savedAnswer=!questionGroup&&first.kind==='answer'?(saved?.inverse_answers_to||[]).find(answer=>answer&&typeof answer==='object'&&(answer.identifier||String(answer.id||'').split('/').at(-1))===sourceId):null;
+      const questionDate=matched.find(row=>row.question_date)?.question_date||null;
+      const answerDate=matched.filter(row=>row.kind==='answer'&&row.date).map(row=>row.date).sort().at(-1)||null;
+      const hits=matched.map(row=>{const ids=memberIds(row.source_id);return {...this.variant(row),memberIds:ids,people:people(ids,row.kind)};});
+      const ids=members?[...new Set([...(memberIds(sourceId)||[]),...hits.flatMap(hit=>hit.memberIds||[])])].sort((a,b)=>a-b):null;
+      const titles=item?.titles||saved?.title_dcterms||Object.assign({},...(Array.isArray(saved?.is_realized_by)?saved.is_realized_by:[]).map(realization=>realization.title||{}));
+      return {sourceId,kind:questionGroup?'question':first.kind,parentId:questionGroup?null:first.parent_id,date:selectedRow.date,
+        questionDate,answerDate,title:localTitle(titles)||sourceId,reference:item?.reference||(first.kind==='answer'&&!questionGroup?savedAnswer?.label:saved?.label)||sourceId,memberIds:ids,people:people(ids,questionGroup?'question':first.kind),hits};
+    });
+    const next=offset+results.length,more=next<total;
+    return {total,limit,offset,nextOffset:more&&next<=CORPUS_LIMITS.searchOffset?next:null,truncated:more&&next>CORPUS_LIMITS.searchOffset,query:match,group,dateBasis,sort,
+      results,hits:results.flatMap(result=>result.hits)};
+  }
+  close(){if(!this.readOnly)this.release();this.db.close();}
+}

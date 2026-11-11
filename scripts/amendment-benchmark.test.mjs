@@ -1,0 +1,638 @@
+import test,{beforeEach} from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtemp,rm,writeFile,readFile,mkdir} from 'node:fs/promises';
+import {fileURLToPath} from 'node:url';
+import {execFileAsync,registerSubprocesses} from '../server/test-support/subprocess.mjs';
+import {producerFingerprint} from './amendment-benchmark-producers.mjs';
+import os from 'node:os';
+import path from 'node:path';
+import {parseProposal} from '../server/proposal-structure.mjs';
+import {resolveProposalPlacement} from '../server/proposal-placement.mjs';
+import {documentContextPlacement} from '../server/document-context-placement.mjs';
+import {resolveAmendmentPlacement} from '../server/document-context-model.mjs';
+import {classifyRow,classify,verifyPlacement,metrics,compareBaseline,targetPatterns,oracleNormal,existingLawOracleNormal,projectionCompatibility,instructionFrameWording} from './amendment-benchmark-model.mjs';
+import {InputCache,allowedInput,retryDelay,digest,apiOrigin} from './amendment-benchmark-cache.mjs';
+import {harnessIdentity,options,monday,evaluateReport,acquireReport,placeableDecision,contextUrl,placeWithInstructionFrame,nleReport,withListDocumentDate} from './amendment-benchmark.mjs';
+import {expectedOperation} from './amendment-benchmark-operation-oracle.mjs';
+
+beforeEach(registerSubprocesses);
+const apiBase='https://explorer.example';
+const source=paragraphs=>({paragraphs,structureStatus:'extracted',textLanguage:'en',paragraphSources:paragraphs.map((_,ordinal)=>({path:'body/p'+ordinal,ordinal,container:'body',containerPath:'body',segment:0,complete:true})),paragraphProperties:paragraphs.map(()=>({styleId:'Normal',numberingComplete:true,notesComplete:true}))});
+const item=paragraphs=>[{kind:'act',index:1,proposal:parseProposal(source(paragraphs),{language:'en'})}];
+const wording=(targetLabel,originalText='',proposedText='New text.')=>({targetLabel,originalText,proposedText,language:'en',baseline:'commission-proposal'});
+const stages=()=>({S1:{status:'passed'},S2:{status:'passed'},S3:{status:'passed'},S4:{status:'passed'},S5:{status:'placed'},S6:{status:'verified'}});
+test('existing-law oracle preserves internal list punctuation and labels across source line wraps',()=>{
+  const left='1. Lead:\na) first;\nb) second;',right='1. Lead:\na) first; b) second;',labels=[{value:'1'},{value:'a'},{value:'b'}];
+  assert.equal(existingLawOracleNormal(left,labels),existingLawOracleNormal(right,labels));
+  assert.notEqual(existingLawOracleNormal(left,labels),existingLawOracleNormal(right.replace('first;','first'),labels));
+  assert.notEqual(existingLawOracleNormal(left,labels),existingLawOracleNormal(right.replace('b)','c)'),labels));
+});
+test('classifier distinguishes affirmative source absence, processing limits, unverified and false placements',()=>{
+  assert.equal(classify(stages()).outcome,'correct');
+  for(const reason of ['wording-comparison-grid','wording-vertical-text-loss','docx-amendment-not-extracted','input-http-503','wording-source-not-indexed']) {
+    const value=stages();value.S2={status:'blocked',reason};assert.equal(classify(value).outcome,'withheld-pipeline');
+  }
+  for(const reason of ['source-document-unavailable','source-wording-empty']) {
+    const value=stages();value.S2={status:'blocked',reason};assert.equal(classify(value).outcome,'withheld-source');
+  }
+  const unverified=stages();unverified.S6={status:'unverified',reason:'no-oracle'};assert.equal(classify(unverified).outcome,'placed-unverified');
+  const falsePlacement=stages();falsePlacement.S1={status:'blocked',reason:'missing-link'};falsePlacement.S6={status:'failed',reason:'bad-span'};assert.equal(classify(falsePlacement).outcome,'false-placement');
+  const quote=stages();quote.S3={status:'blocked',reason:'unparsed'};assert.equal(classify(quote).outcome,'correct','actual quote fallback can verify without a structured label');
+});
+test('replace/delete oracle reads exact splice coordinates, tolerates only provision labels and typography',()=>{
+  const items=item(['Article 1','1. A café sentence.','2. A different sentence.']);
+  const amendment=wording('Article 1 – paragraph 1','A cafe\u0301 sentence;','Deleted');
+  const placement=resolveProposalPlacement(items,amendment);assert.equal(placement.status,'placed');
+  assert.equal(verifyPlacement({placement,wording:amendment,items}).status,'verified');
+  assert.equal(verifyPlacement({placement:{...placement,span:{start:2,end:2},splice:{start:{paragraph:2,offset:0},end:{paragraph:2,offset:24}}},wording:amendment,items}).status,'failed');
+  assert.equal(verifyPlacement({placement:{...placement,splice:{start:{paragraph:1,offset:500},end:{paragraph:1,offset:1}}},wording:amendment,items}).reason,'oracle-invalid-span');
+  assert.equal(verifyPlacement({placement,wording:{...amendment,originalText:'(not) A café sentence.'},items}).status,'failed');
+});
+test('oracle preserves punctuation normalization but accepts unique small resolution damage',()=>{
+  const rows=['7. Allocates funding as follows:','the first programme receives ten units;','the second programme receives five units.','the balance remains available;'];
+  const text=source(['The European Parliament,',...rows,'8. Requests a report.','ANNEX']);
+  const original=rows.join(' '),amendment={...wording('Paragraph 7',original,'Revised allocation.'),baseline:'motion-resolution'};
+  // Supply coordinates directly: this tests the independent oracle, not the placer.
+  for(const operation of ['replace','delete']) {
+    const placement={status:'placed',operation,span:{start:1,end:4}},chosen=operation==='delete'?{...amendment,proposedText:'deleted.'}:amendment;
+    assert.equal(verifyPlacement({placement,wording:chosen,text}).status,'verified');
+    assert.equal(verifyPlacement({placement,wording:{...chosen,originalText:original.replace('units;','units')},text}).status,'verified');
+    assert.equal(verifyPlacement({placement,wording:{...chosen,originalText:original.replace('units.','units')},text}).status,'verified');
+    assert.equal(verifyPlacement({placement:{...placement,span:{start:1,end:3}},wording:chosen,text}).status,'failed');
+  }
+  const labels=[{value:'7'}];
+  assert.equal(oracleNormal(rows.join('\n'),labels),oracleNormal(original,labels));
+  assert.equal(oracleNormal(rows.join('\r\n'),labels),oracleNormal(original,labels));
+  assert.equal(oracleNormal(rows.join('\n'),labels),'Allocates funding as follows: the first programme receives ten units; the second programme receives five units. the balance remains available');
+  const quotedRows=['7. Amends the rule:','“A synthetic obligation applies.”;','the reporting duty remains;'];
+  const quotedText=source(['The European Parliament,',...quotedRows,'8. Requests a report.','ANNEX']);
+  const quotedOriginal=quotedRows.join('\n').replace('applies.”;','applies.;”');
+  const quoted={...amendment,originalText:quotedOriginal};
+  const placement={status:'placed',operation:'replace',span:{start:1,end:3}};
+  assert.equal(verifyPlacement({placement,wording:quoted,text:quotedText}).status,'verified','quote/terminator ordering remains typographic');
+  assert.equal(verifyPlacement({placement,wording:{...quoted,originalText:quotedOriginal.replace('applies.;”','applies.”')},text:quotedText}).status,'failed','the internal semicolon still matters');
+});
+test('independent operation oracle fails the old localized replace placements at the correct coordinates',async()=>{
+  const {examples}=JSON.parse(await readFile(new URL('../server/fixtures/amendment-operation-excerpts.json',import.meta.url),'utf8'));
+  for(const {language,deletion,insertion} of examples) {
+    const amendment={...deletion,language,baseline:'motion-resolution',targetLabel:'',targetPath:null};
+    const text={...source([deletion.originalText]),textLanguage:language};
+    const placement={status:'placed',operation:'replace',span:{start:0,end:0}};
+    const result=verifyPlacement({placement,wording:amendment,text});
+    assert.deepEqual(result,{status:'failed',reason:'oracle-operation-mismatch',expectedOperation:'delete',actualOperation:'replace'},language);
+    const value=stages();value.S5=placement;value.S6=result;
+    assert.equal(classify(value).outcome,'false-placement',language);
+    assert.equal(expectedOperation({...insertion,proposedText:'New wording.'}),'insert',language);
+    assert.equal(expectedOperation({...deletion,proposedText:deletion.proposedText+' Ordinary prose.'}),'replace',language);
+    assert.equal(expectedOperation({...deletion,proposedText:null}),null,language);
+  }
+  const amendment=wording('Article 1','Original.','Replacement.');
+  assert.equal(verifyPlacement({placement:{status:'placed',operation:'delete'},wording:amendment}).reason,'oracle-operation-mismatch');
+});
+test('introductory-part addresses are checked against their own provision',()=>{
+  const items=item(['Article 1','1. Lead text of the paragraph:','(a) first point;','2. Other paragraph lead:']);
+  const amendment=wording('Article 1 – paragraph 1 – introductory part','Lead text of the paragraph:','New lead:');
+  const placement=resolveProposalPlacement(items,{...amendment,targetLabel:'Article 1 – paragraph 1'});assert.equal(placement.status,'placed');
+  assert.equal(verifyPlacement({placement,wording:amendment,items}).status,'verified');
+  const elsewhere={...placement,span:{start:3,end:3},splice:{start:{paragraph:3,offset:0},end:{paragraph:3,offset:24}}};
+  assert.equal(verifyPlacement({placement:elsewhere,wording:amendment,items}).status,'failed','a span outside the addressed provision fails');
+});
+
+test('a resolution introductory part is verified only within its lead rows',()=>{
+  const text=source(['The European Parliament,','1. Calls for:','(a) First point;','2. Next paragraph.','ANNEX']);
+  const at=row=>({status:'placed',operation:'replace',span:{start:row,end:row}});
+  const lead={...wording('Paragraph 1 – introductory part','Calls for:','Urges:'),baseline:'motion-resolution'};
+  assert.equal(verifyPlacement({placement:at(1),wording:lead,text}).status,'verified');
+  const child={...wording('Paragraph 1 – introductory part','(a) First point;','(a) Changed;'),baseline:'motion-resolution'};
+  assert.equal(verifyPlacement({placement:at(2),wording:child,text}).status,'failed','a child point is not the introductory part');
+  const bare=source(['The European Parliament,','1. Calls for change.','2. Next paragraph.','ANNEX']);
+  const noChildren={...wording('Paragraph 1 – introductory part','Calls for change.','Urges change.'),baseline:'motion-resolution'};
+  assert.equal(verifyPlacement({placement:at(1),wording:noChildren,text:bare}).reason,'oracle-introductory-part-unavailable');
+});
+
+test('proposal insertion oracle asserts parent, complete sibling subtree and following sibling order',()=>{
+  const items=item(['Article 1','1. First.','Article 2','1. Second.']);
+  const amendment=wording('Article 1 a (new)');const placement=resolveProposalPlacement(items,amendment);assert.equal(placement.status,'placed');
+  assert.equal(verifyPlacement({placement,wording:amendment,items}).status,'verified');
+  assert.equal(verifyPlacement({placement:{...placement,insertAfter:0,insertBefore:1},wording:amendment,items}).reason,'oracle-insertion-boundary-mismatch');
+  const nested=item(['Article 1','1. First.','2. Second.','Article 2','1. Third.']);
+  const child=wording('Article 1 – paragraph 1 a (new)'),placed=resolveProposalPlacement(nested,child);
+  assert.equal(verifyPlacement({placement:placed,wording:child,items:nested}).status,'verified');
+  assert.equal(verifyPlacement({placement:placed,wording:{...child,targetLabel:'Article 2 – paragraph 1 a (new)'},items:nested}).reason,'oracle-parent-mismatch');
+  const next=structuredClone(items);next[0].proposal.units.flatMap(u=>u.children||[]).find(u=>u.kind==='article'&&u.label.number===2).label.number=1;
+  assert.equal(verifyPlacement({placement,wording:amendment,items:next}).status,'failed');
+});
+test('resolution oracles cover numeric and recital insertion and do not accept the wrong source span',()=>{
+  const text=source(['The European Parliament,','A. First recital.','B. Second recital.','1. First paragraph.','2. Second paragraph.','ANNEX']);
+  for(const targetLabel of ['Paragraph 1 a (new)','Recital A a (new)']) {
+    const amendment={...wording(targetLabel),baseline:'motion-resolution'};
+    const placement=resolveAmendmentPlacement(text,amendment);assert.equal(placement.status,'placed',placement.reason);
+    assert.equal(verifyPlacement({placement,wording:amendment,text}).status,'verified',targetLabel);
+  }
+  const amendment={...wording('Paragraph 1','First paragraph.'),baseline:'motion-resolution'};
+  const placement=resolveAmendmentPlacement(text,amendment);assert.equal(placement.status,'placed');
+  assert.equal(verifyPlacement({placement,wording:amendment,text}).status,'verified');
+  assert.equal(verifyPlacement({placement:{...placement,span:{start:4,end:4}},wording:amendment,text}).reason,'oracle-original-span-mismatch');
+  for(const label of ['A','AA']) {
+    const recital=source(['The European Parliament,',label+'. First recital.','1. First paragraph.','ANNEX']);
+    const words={...wording('Recital '+label,'First recital.'),baseline:'motion-resolution'};
+    const placed=resolveAmendmentPlacement(recital,words);assert.equal(placed.status,'placed');
+    assert.equal(verifyPlacement({placement:placed,wording:words,text:recital}).status,'verified','published recital prefixes may be omitted in original wording');
+  }
+});
+test('insertion oracle checks the preceding sibling and orders multi-letter recital labels after Z',()=>{
+  for(const [paragraphs,targetLabel,expected] of [
+    [['3. Three.','4. Four.','3b. Misordered.','5. Five.'],'Paragraph 3 c (new)','failed'],
+    [['Z. Last single-letter recital.','AA. First double-letter recital.','1. Paragraph.'],'Recital Z a (new)','verified'],
+  ]) {
+    const text=source(['The European Parliament,',...paragraphs,'ANNEX']),amendment={...wording(targetLabel),baseline:'motion-resolution'};
+    const placement=resolveAmendmentPlacement(text,amendment);assert.equal(placement.status,'placed');
+    assert.equal(verifyPlacement({placement,wording:amendment,text}).status,expected);
+  }
+  const heading='I. State of play',text=source(['The European Parliament,','AA. Whereas a source recital;','AB. Whereas the final recital;',heading,'1. First operative paragraph.','ANNEX']);
+  text.paragraphFormats=text.paragraphs.map((_,i)=>i===3?{marks:[{kind:'bold',start:0,end:heading.length},{kind:'italic',start:0,end:heading.length}]}:{});
+  const amendment={...wording('Recital AB a (new)'),baseline:'motion-resolution'},placement=resolveAmendmentPlacement(text,amendment);
+  assert.equal(placement.status,'placed');assert.equal(verifyPlacement({placement,wording:amendment,text}).status,'verified','the raw bold heading closes the final recital before the heading');
+});
+const row=(id,outcome='correct',voteIds=['vote-1'])=>({key:id,id,outcome,reason:outcome,documentType:'legislative-report',language:'en',patterns:['article'],voteIds});
+test('metrics count amendments once, preserve null zero-denominator shares and deduplicate collective/split votes',()=>{
+  const value=metrics([row('a'),row('b','withheld-source'),row('c','withheld-pipeline',['vote-2'])]);
+  assert.equal(value.headline,0.5);assert.equal(value.raw,1/3);assert.deepEqual(value.votes,{total:2,correct:0,share:0});
+  assert.equal(metrics([]).headline,null);assert.equal(metrics([row('a','withheld-source')]).headline,null);
+  assert.deepEqual(value.taxonomy[0].examples,['a']);
+});
+test('baseline gate reports every deterioration, catches new false placements, checks input comparability and emits metric deltas',()=>{
+  const wrap=rows=>({sample:{mode:'documents'},inputs:[{url:'public',sha256:'hash'}],rows,metrics:metrics(rows)});
+  const before=wrap([row('a'),row('b','withheld-pipeline')]),after=wrap([row('a','placed-unverified'),row('b','false-placement')]);
+  const diff=compareBaseline(after,before);assert.equal(diff.failed,true);assert.deepEqual(diff.regressions.map(r=>r.id),['a','b']);assert.equal(diff.deltas.headline,-0.5);assert(diff.taxonomyDeltas.length);
+  assert.equal(compareBaseline(before,before).failed,false);
+  assert.throws(()=>compareBaseline({...after,inputs:[]},before),/hashes differ/);
+  assert.equal(compareBaseline(wrap([row('a','false-placement')]),wrap([row('a','false-placement')])).failed,true);
+  assert.equal(compareBaseline(wrap([]),before).regressions.length,2);
+});
+test('rejection denominator transitions retain raw losses and require complete source-bound native proof',()=>{
+  const wrap=rows=>({snapshotId:'frozen',sample:{mode:'documents'},inputs:[],rows,metrics:metrics(rows)}),before=wrap([row('a')]);
+  const excluded={...row('a','not-placeable'),reason:'whole-document-rejection',wordingSource:{url:'https://public.example/a_en.docx',sha256:'a'.repeat(64)},stages:{S5:{status:'document-operation',operation:'reject',scope:'council-position'}},documentOperation:{status:'verified',reason:'source-attested-rejection',scope:'council-position',source:{sha256:'a'.repeat(64),assertion:'complete-native-comparison-cells',originalText:'',proposedText:'The European Parliament rejects the Council position.',amendmentPath:'/w:document[1]/w:body[1]/w:p[1]'}}};
+  const diff=compareBaseline(wrap([excluded]),before);
+  assert.equal(diff.failed,true,'raw strict ratchet is not waived');assert.equal(diff.regressions.length,1);assert.equal(diff.rawLostCorrect,1);assert.equal(diff.adjustedLostCorrect,0);
+  assert.equal(diff.authorizedDenominatorTransitions.length,1);assert.equal(diff.authorizedDenominatorTransitions[0].sourceUrl,excluded.wordingSource.url);
+  for(const outcome of ['withheld-pipeline','placed-unverified','false-placement'])assert.equal(compareBaseline(wrap([{...excluded,outcome}]),before).authorizedDenominatorTransitions.length,0);
+  for(const change of [r=>r.stages.S5.insertAfter=1,r=>r.documentOperation.source.sha256='b'.repeat(64),r=>r.documentOperation.source.originalText='existing wording',r=>r.documentOperation.status='unverified',r=>delete r.documentOperation.source.assertion]){
+    const altered=structuredClone(excluded);change(altered);const result=compareBaseline(wrap([altered]),before);assert.equal(result.authorizedDenominatorTransitions.length,0);assert.equal(result.adjustedLostCorrect,1);
+  }
+  assert.equal(compareBaseline(wrap([]),before).adjustedLostCorrect,1);
+});
+test('patterns retain grammar and extraction limits; sample options select exact dates and term-10 IDs',()=>{
+  assert(targetPatterns(wording('Article 1 – paragraph 2 a (new)'),[{code:'vertical-text-loss'},{code:'comparison-grid'}]).includes('letter-suffix'));
+  assert(targetPatterns(wording('Article -1')).includes('negative-label'));
+  assert.equal(options([]).weeks,8);assert.equal(options([]).fetchMissing,false);
+  assert.throws(()=>options(['--fetch','--delay-ms','0']),/at least 750/);
+  assert.deepEqual(options(['--document','B-10-2026-0001','--document','B-10-2026-0001']).documents,['B-10-2026-0001']);
+  assert.throws(()=>options(['--from','2026-01-01']),/ordered/);assert.throws(()=>options(['--document','A-9-2024-0001']),/term-10/);
+  assert.equal(monday('2026-10-22'),'2026-10-19');
+});
+test('URL cache is hash-verified, offline by default, bounded and honours Retry-After for retries and the next URL',async()=>{
+  const directory=await mkdtemp(path.join(os.tmpdir(),'amendment-bench-test-'));
+  try {
+    const url='https://explorer.example/api/amendments?limit=50',calls=[],waits=[];
+    const cache=new InputCache(directory,{apiBase,fetchMissing:true,cap:3,delay:0,sleep:async ms=>waits.push(ms),fetcher:async (url,opts)=>{calls.push({url,opts});return calls.length===1?new Response('busy',{status:429,headers:{'Retry-After':'2'}}):new Response('{"ok":true}');}});
+    const first=await cache.json(url);assert(first.value.ok);assert.equal(calls.length,2);assert(waits.some(ms=>ms>=1900));assert.equal(calls[0].opts.redirect,'manual');
+    const offline=new InputCache(directory,{apiBase,fetcher:()=>{throw new Error('network forbidden');}});
+    assert.equal((await offline.json(url)).value.ok,true);assert.equal(offline.requests,0);
+    await assert.rejects(()=>offline.get(url+'&offset=50'),/input-not-cached/);
+    const capped=new InputCache(directory,{apiBase,fetchMissing:true,cap:0});await assert.rejects(()=>capped.get(url+'&offset=50'),/request-cap-exhausted/);
+    const last=new InputCache(directory,{apiBase,fetchMissing:true,cap:2,delay:0,sleep:async ms=>waits.push(ms),fetcher:async()=>new Response('busy',{status:503,headers:{'Retry-After':'3'}})});
+    await assert.rejects(()=>last.get(url+'&offset=100'),/not cached/);assert.equal(last.requests,2);
+    await writeFile(path.join(directory,digest(url)+'.body'),'tampered');await assert.rejects(()=>offline.get(url),/hash mismatch/);
+  } finally {await rm(directory,{recursive:true,force:true});}
+  assert.equal(retryDelay('2'),2000);assert.equal(retryDelay('Wed, 21 Oct 2026 00:00:03 GMT',Date.parse('2026-10-21T00:00:00Z')),3000);
+  for(const url of ['http://explorer.example/api/amendments','https://explorer.example/api/healthz','https://data.europarl.europa.eu/api/v2/meps','https://example.org/x.docx'])assert.equal(allowedInput(url,apiBase),false);
+});
+test('official DOCX redirects use the shared host allowlist, cache both hops, and charge the request cap',async()=>{
+  const directory=await mkdtemp(path.join(os.tmpdir(),'amendment-bench-redirect-'));
+  try {
+    const original='https://data.europarl.europa.eu/distribution/test/file.docx',target='https://redmapl3.europarl.europa.eu/RedmapFront/media/test/file.docx';
+    const cache=new InputCache(directory,{apiBase,fetchMissing:true,cap:2,delay:0,sleep:async()=>{},fetcher:async url=>url===original?new Response('',{status:302,headers:{location:target}}):new Response('DOCX')});
+    const result=await cache.get(original);assert.equal(result.ok,true);assert.equal(result.url,original);assert.equal(result.resolvedSourceUrl,target);assert.equal(result.body.toString(),'DOCX');assert.equal(cache.requests,2);assert.equal(cache.manifest().length,2);
+    const offline=new InputCache(directory,{apiBase});assert.equal((await offline.get(original)).body.toString(),'DOCX');assert.equal(offline.requests,0);
+    const forbidden=new InputCache(directory,{apiBase,fetchMissing:true,cap:1,delay:0,sleep:async()=>{},fetcher:async()=>new Response('',{status:302,headers:{location:'https://example.org/file.docx'}})});
+    await assert.rejects(()=>forbidden.get(original.replace('file.docx','bad.docx')),/unapproved-document-redirect/);assert.equal(forbidden.requests,1);
+    const limited=new InputCache(directory,{apiBase,fetchMissing:true,cap:1,delay:0,sleep:async()=>{},fetcher:async()=>new Response('',{status:302,headers:{location:target.replace('file.docx','missing.docx')}})});
+    await assert.rejects(()=>limited.get(original.replace('file.docx','limited.docx')),/request-cap-exhausted/);assert.equal(limited.requests,1);
+  } finally {await rm(directory,{recursive:true,force:true});}
+});
+
+// A tiny synthetic DOCX, generated entirely in memory. No downloaded fixtures.
+function docx(xml) {
+  const name=Buffer.from('word/document.xml'),body=Buffer.from(xml),local=Buffer.alloc(30),central=Buffer.alloc(46),end=Buffer.alloc(22);
+  local.writeUInt32LE(0x04034b50);local.writeUInt32LE(body.length,18);local.writeUInt32LE(body.length,22);local.writeUInt16LE(name.length,26);
+  central.writeUInt32LE(0x02014b50);central.writeUInt32LE(body.length,20);central.writeUInt32LE(body.length,24);central.writeUInt16LE(name.length,28);
+  end.writeUInt32LE(0x06054b50);end.writeUInt16LE(1,8);end.writeUInt16LE(1,10);end.writeUInt32LE(central.length+name.length,12);end.writeUInt32LE(local.length+name.length+body.length,16);
+  return Buffer.concat([local,name,body,central,name,end]);
+}
+const paragraph=value=>'<w:p><w:r><w:t>'+value.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')+'</w:t></w:r></w:p>';
+test('unknown-category Council headings select the same baseline acquisition as the endpoint',async()=>{
+ const document='A-10-2026-0001',url='https://data.europarl.europa.eu/distribution/test/council.docx',id=document+'-AM-1';
+ const cell=value=>'<w:tc>'+paragraph(value)+'</w:tc>',row=(a,b)=>'<w:tr>'+cell(a)+cell(b)+'</w:tr>';
+ const body=docx('<w:document xmlns:w="urn:word"><w:body>'+paragraph('<Amend><NumAm>1</NumAm>')+paragraph('<Article>Recital 1</Article>')+'<w:tbl>'+row('Text proposed by the Council','Amendment')+row('Original recital.','Changed recital.')+'</w:tbl>'+paragraph('</Amend>')+'</w:body></w:document>');
+ const input={id,number:1,targetDocumentId:document,listId:document+'-AM-001-001',wordingSource:{url},baseline:'unknown',language:'en',decisions:[{id:'vote-1',date:'2026-10-22',sittingId:'MTG-PL-2026-10-22',amendmentIds:[id],source:{url:'https://data.europarl.europa.eu/api/v2/example',fetchedAt:'2026-10-23T00:00:00Z'}}]};
+ const cache={apiBase,get:async()=>({ok:true,body,url,sha256:digest(body),fetchedAt:'2026-10-23T00:00:00Z'}),json:async url=>({input:{ok:true,url},value:{documentId:document}})};
+ let councilReads=0;
+ const replay={observeFiles(){},request:async()=>({payload:{data:[{}]}}),council:async()=>{councilReads++;return {baseline:{status:'unavailable',language:'en',gaps:['native-source-unavailable']},items:[]};},text:async()=>{throw Error('Council heading must not use the resolution replay');}};
+ const [result]=await evaluateReport([input],{mode:'documents',asOf:'2026-10-26'},cache,{replay});
+ assert.equal(councilReads,1);assert.equal(result.stages.S4.reason,'council_position_unavailable');
+});
+test('report evaluation re-extracts cached DOCX despite null live wording and ignores live placement',async()=>{
+  const document='B-10-2026-0001',id=document+'-AM-1',url='https://data.europarl.europa.eu/distribution/test/test_en.docx';
+  const cell=value=>'<w:tc>'+paragraph(value)+'</w:tc>',tr=(a,b)=>'<w:tr>'+cell(a)+cell(b)+'</w:tr>';
+  const body=docx('<w:document xmlns:w="urn:word"><w:body>'+paragraph('<Amend><Date>1.10.2026</Date><NumAm>1</NumAm>')+paragraph('<Article>Paragraph 1</Article>')+'<w:tbl>'+tr('Motion for a resolution','Amendment')+tr('First paragraph.','Changed paragraph.')+'</w:tbl>'+paragraph('</Amend>')+'</w:body></w:document>');
+  const input={id,number:1,targetDocumentId:document,listId:document+'-AM-001-001',wordingSource:{url},originalText:null,proposedText:null,language:'en',decisions:[{id:'vote-1',date:'2026-10-22',sittingId:'MTG-PL-2026-10-22',amendmentIds:[id],reference:'Paragraph 1',source:{url:'https://data.europarl.europa.eu/api/v2/example',fetchedAt:'2026-10-23T00:00:00Z'}}]};
+  const cache={apiBase,get:async()=>({ok:true,body,url,fetchedAt:'2026-10-23T00:00:00Z',sha256:digest(body)}),json:async url=>({input:{ok:true,url},value:{documentId:document,document:{selectedText:source(['The European Parliament,','1. First paragraph.','2. Second paragraph.','ANNEX'])},placement:{status:'placed',span:{start:999,end:999}}}})};
+  const [result]=await evaluateReport([input],{mode:'documents',asOf:'2026-10-26'},cache);
+  assert.equal(result.outcome,'correct',JSON.stringify(result.stages));assert.equal(result.stages.S5.span.start,1);assert.equal(result.stages.S2.status,'passed');
+  const observations=[];const calibrated=await evaluateReport([input],{mode:'documents',asOf:'2026-10-26'},cache,{adoptedCalibration:{observe:observation=>observations.push(observation)}});
+  assert.deepEqual(calibrated,[result]);assert.equal(observations.length,1);assert.equal(observations[0].wording.proposedText,'Changed paragraph.');assert.equal(observations[0].text.paragraphs[1],'1. First paragraph.');
+  const [missing]=await evaluateReport([input],{mode:'documents',asOf:'2026-10-26'},{...cache,get:async()=>({ok:false,status:503,error:'http-503',url})});assert.equal(missing.outcome,'withheld-pipeline');
+  const conflict=structuredClone(input);conflict.decisions.push({...input.decisions[0],id:'old-vote',date:'2026-09-01',sittingId:'MTG-PL-2026-09-01',reference:'Paragraph 2'});
+  const [conflicting]=await evaluateReport([conflict],{mode:'date-window',from:'2026-10-01',to:'2026-10-26',asOf:'2026-10-26'},cache);
+  assert.equal(conflicting.stages.S5.status,'placed');assert.deepEqual(conflicting.stages.S5.finalPlacementCheck,{adoptedTextUrl:null});
+});
+
+test('cleared live baseline markers do not multiply report/language proposal acquisition',async()=>{
+  const document='A-10-2026-0001',url='https://data.europarl.europa.eu/distribution/test/commission.docx';
+  const cell=value=>'<w:tc>'+paragraph(value)+'</w:tc>',tr=(a,b)=>'<w:tr>'+cell(a)+cell(b)+'</w:tr>';
+  const block=number=>paragraph('<Amend><Date>1.10.2026</Date><NumAm>'+number+'</NumAm>')+paragraph('<Article>Article 1 – paragraph 1</Article>')+'<w:tbl>'+tr('Text proposed by the Commission','Amendment')+tr('First paragraph.','Changed paragraph.')+'</w:tbl>'+paragraph('</Amend>');
+  const body=docx('<w:document xmlns:w="urn:word"><w:body>'+block(1)+block(2)+'</w:body></w:document>');
+  const rows=[1,2].map(number=>({id:document+'-AM-'+number,number,targetDocumentId:document,listId:document+'-AM-001-002',wordingSource:{url},originalText:null,proposedText:null,baseline:'unknown',language:'en',decisions:[{id:'vote-'+number,date:'2026-10-22',sittingId:'MTG-PL-2026-10-22',amendmentIds:[document+'-AM-'+number],source:{url:'https://data.europarl.europa.eu/api/v2/example',fetchedAt:'2026-10-23T00:00:00Z'}}]}));
+  const calls=[];
+  const cache={apiBase,get:async()=>({ok:true,body,url,fetchedAt:'2026-10-23T00:00:00Z',sha256:digest(body)}),json:async url=>{calls.push(url);return {input:{ok:true,url},value:{documentId:document,baseline:{language:'en',status:'available'},proposal:{items:item(['Article 1','1. First paragraph.'])}}};}};
+  const evaluated=await evaluateReport(rows,{mode:'documents',asOf:'2026-10-26'},cache);
+  assert.equal(calls.length,2);assert(evaluated.every(row=>row.outcome==='correct'));
+});
+
+test('independent oracle rejects a matching phrase in the wrong addressed unit and requires unique quote fallback',()=>{
+  const items=item(['Article 1','1. The same phrase.','2. The same phrase.']);
+  const amendment=wording('Article 1 – paragraph 1','The same phrase.');
+  const other=resolveProposalPlacement(items,{...amendment,targetLabel:'Article 1 – paragraph 2'});
+  assert.equal(other.status,'placed');
+  assert.equal(verifyPlacement({placement:other,wording:amendment,items}).reason,'oracle-address-span-mismatch');
+  const inline=structuredClone(item(['Article 1','1. The same phrase. 2. The same phrase.']));
+  const unit=inline[0].proposal.units.flatMap(u=>u.children||[]).flatMap(u=>u.children||[]).find(u=>u.kind==='paragraph');
+  unit.spans=[{paragraph:1,start:0,end:18}];
+  const start=inline[0].proposal.paragraphs[1].text.lastIndexOf('The same phrase.');
+  const wrongInline={status:'placed',operation:'replace',itemIndex:0,span:{start:1,end:1},splice:{start:{paragraph:1,offset:start},end:{paragraph:1,offset:start+16}}};
+  assert.equal(verifyPlacement({placement:wrongInline,wording:amendment,items:inline}).reason,'oracle-address-span-mismatch');
+  const text=source(['The European Parliament,','1. The same phrase.','2. The same phrase.','ANNEX']);
+  const unknown={...amendment,baseline:'motion-resolution',targetLabel:'Unparsed heading'};
+  const placement={status:'placed',operation:'replace',span:{start:1,end:1}};
+  assert.equal(verifyPlacement({placement,wording:unknown,text}).reason,'oracle-original-not-unique');
+  const french={...unknown,language:'fr',targetLabel:'Paragraphe 1'};
+  const frenchText={...text,paragraphs:['Le Parlement européen,',...text.paragraphs.slice(1)],textLanguage:'fr'};
+  assert.equal(verifyPlacement({placement,wording:french,text:frenchText}).status,'verified');
+  assert.equal(verifyPlacement({placement:{...placement,span:{start:2,end:2}},wording:french,text:frenchText}).reason,'oracle-address-span-mismatch');
+  const unique=source(['The European Parliament,','1. The same phrase.','2. A unique phrase.','ANNEX']);
+  assert.equal(verifyPlacement({placement,wording:unknown,text:unique}).status,'verified');
+  assert.equal(oracleNormal('“(ab) A\u00a0phrase—here;”',[{value:'ab'}]),'A phrase-here');
+  assert.notEqual(oracleNormal('A phrase'),oracleNormal('a phrase'));
+});
+
+test('acquisition includes all indexed lists and both contexts before checkout extraction, including unreadable variants',async()=>{
+  const document='A-10-2026-0001',urls=[1,2,3].map(n=>'https://data.europarl.europa.eu/distribution/test/list'+n+'.docx');
+  const rows=[1,2].map((n)=>({id:document+'-AM-'+n,targetDocumentId:document,number:n,language:'en',listId:document+'-AM-001-002',wordingSource:{url:urls[n-1]},decisions:n===1?[{date:'2026-10-22',sittingId:'MTG-PL-2026-10-22'}]:[]}));
+  rows[0].variants=[{...rows[0]},{...rows[0],wordingSource:{url:urls[2]},listId:document+'-AM-003-004'}];
+  const gets=[],json=[];
+  const cache={apiBase,get:async url=>{gets.push(url);return {ok:true,body:Buffer.from('unreadable DOCX')};},json:async url=>{json.push(url);return {input:{ok:true,url},value:{documentId:document,version:6}};}};
+  await acquireReport(rows,{mode:'documents',asOf:'2026-10-27'},cache);
+  assert.deepEqual(gets,[...urls].sort());assert.equal(json.length,2);assert(!new URL(json[0]).searchParams.has('amendment'));assert(new URL(json[1]).searchParams.has('amendment'));
+  const again=[];await acquireReport(rows,{mode:'documents',asOf:'2026-10-27'},{...cache,get:async url=>again.push(url)});
+  assert.deepEqual(again,gets,'acquisition does not depend on any extraction result');
+});
+
+test('baseline checks full snapshot identity, warns on oracle changes and refuses live-version mismatches',()=>{
+  const wrap=rows=>({snapshotId:'fixed-full-manifest',sample:{},inputs:[{url:'used',sha256:'a'},{url:'unused',sha256:'b'}],code:{files:{'scripts/amendment-benchmark-model.mjs':'old'}},compatibility:{compatible:true},rows,metrics:metrics(rows)});
+  const before=wrap([row('a','withheld-pipeline')]),after=wrap([row('a')]);after.code.files['scripts/amendment-benchmark-model.mjs']='new';
+  const diff=compareBaseline(after,before);assert.equal(diff.failed,false);assert.equal(diff.deltas['counts.correct'],1);assert.equal(diff.warnings.length,1);
+  assert.throws(()=>compareBaseline({...after,snapshotId:'different'},before),/hashes differ/);
+  const refused=compareBaseline({...after,compatibility:{compatible:false}},before);assert.equal(refused.refused,true);assert.equal(refused.failed,true);assert.deepEqual(refused.deltas,{});
+  const stagesWithAcquisition=stages();stagesWithAcquisition.S4={status:'blocked',reason:'acquisition-proposal-projection-unavailable'};
+  assert.equal(classify(stagesWithAcquisition).outcome,'acquisition-unavailable');
+  const counts=metrics([row('a'),row('b','not-placeable',['agreement-vote']),row('c','acquisition-unavailable',['missing-vote'])]);
+  assert.equal(counts.eligible,2);assert.equal(counts.total,3);assert.equal(counts.votes.total,2);assert.equal(counts.uniqueReasons.reduce((sum,r)=>sum+r.count,0),3);
+});
+
+test('transient failures are never cached and overlong Retry-After aborts without waiting',async()=>{
+  const directory=await mkdtemp(path.join(os.tmpdir(),'amendment-bench-transient-'));
+  try {
+    const url=apiBase+'/api/amendments?offset=0';
+    for(const fetcher of [async()=>{throw new Error('network');},async()=>new Response('bad',{status:500}),async()=>new Response('busy',{status:503,headers:{'Retry-After':'61'}})]) {
+      const cache=new InputCache(directory,{apiBase,fetchMissing:true,sleep:async()=>{},fetcher});
+      await assert.rejects(()=>cache.get(url),/not cached/);assert.equal(cache.manifest().length,0);
+      const offline=new InputCache(directory,{apiBase});await assert.rejects(()=>offline.get(url),/input-not-cached/);
+    }
+    assert.equal(apiOrigin(apiBase+'/'),apiBase);assert.throws(()=>apiOrigin('http://explorer.example'),/HTTPS/);
+  }finally{await rm(directory,{recursive:true,force:true});}
+});
+
+ test('provisional agreement ballots remain in the vote denominator',()=>{
+  assert.equal(placeableDecision({reference:'Provisional agreement'}),true);
+  assert.equal(placeableDecision({reference:'Paragraph 1'}),true);
+  assert.equal(placeableDecision({reference:null}),true);
+});
+
+test('shared endpoint orchestration preserves baseline guards and conflicting-evidence precedence',()=>{
+  const chosen={...wording('Paragraph 1','First paragraph.'),baseline:'present-text',targetLabelLanguage:'en'};
+  assert.equal(documentContextPlacement({chosen}).reason,'amends_existing_law');
+  assert.equal(documentContextPlacement({chosen:{...chosen,baseline:'council-position'}}).reason,'council_position_unavailable');
+  assert.equal(documentContextPlacement({chosen,referenceTexts:['Paragraph 1','Paragraph 2']}).reason,'amends_existing_law');
+  assert.notEqual(documentContextPlacement({chosen:{...chosen,baseline:'motion-resolution'},referenceTexts:['Compromise amendment','Joint statement']}).reason,'conflicting_target_evidence','unparsed references are provenance, not location evidence');
+  assert.equal(documentContextPlacement({chosen:null,referenceTexts:['one','two']}).reason,'conflicting_target_evidence');
+  assert.equal(documentContextPlacement({chosen,includeBody:false}),null);
+  assert.equal(documentContextPlacement({amendmentRequested:false}),null);
+});
+
+test('all observed live projection versions must match checkout constants for baseline comparisons',()=>{
+ const code={documentContextVersion:6,proposalParserVersion:'5',documentExtractionVersion:9};
+ const make=(context=6,parser='5',extraction=9)=>[{acquisition:{contextVersions:[context],projectionVersions:[{proposalParsers:[parser],documentExtraction:extraction}]}}];
+ assert.equal(projectionCompatibility(make(),code).compatible,true);
+ for(const rows of [make(5),make(6,'4'),make(6,'5',8)])assert.equal(projectionCompatibility(rows,code).compatible,false);
+ assert.equal(projectionCompatibility([],code).compatible,false);
+});
+
+
+test('placement-only mode compares rows across wrapper versions, fails false placements, and refuses producer/projection changes',()=>{
+  const wrap=rows=>({sample:{},snapshotId:'frozen',inputs:[{url:'unused',sha256:'hash'}],code:{producerFingerprint:{schemaVersion:2,sha256:'same',files:{producer:'same'}}},compatibility:{compatible:false,mismatches:[{kind:'document-context',observed:5,expected:6}]},rows,metrics:metrics(rows)});
+  const baseline=wrap([row('am-1')]),candidate=wrap([row('am-1','false-placement')]);
+  candidate.compatibility.mismatches[0].expected=7;
+  assert.equal(compareBaseline(candidate,baseline).refused,true);
+  const diff=compareBaseline(candidate,baseline,{placementOnly:true});
+  assert.equal(diff.scope,'placement-only-frozen-projections');assert.equal(diff.failed,true);
+  assert.deepEqual(diff.regressions.map(r=>[r.id,r.before,r.after]),[['am-1','correct','false-placement']]);
+  const self=compareBaseline(baseline,baseline,{placementOnly:true});assert.equal(self.failed,false);assert.deepEqual(self.regressions,[]);
+  assert(Object.values(self.deltas).every(delta=>delta===0));
+  const changed=structuredClone(candidate);changed.code.producerFingerprint.files.producer='changed';
+  assert.equal(compareBaseline(changed,baseline,{placementOnly:true}).refused,true);
+  const projection=structuredClone(candidate);projection.compatibility.mismatches.push({kind:'proposal-parser',observed:'5',expected:'6'});
+  assert.equal(compareBaseline(projection,baseline,{placementOnly:true}).refused,true);
+  assert.equal(compareBaseline({...candidate,compatibility:{compatible:false,mismatches:[]}},baseline,{placementOnly:true}).refused,true);
+  assert.throws(()=>compareBaseline({...candidate,inputs:[]},baseline,{placementOnly:true}),/hashes differ/);
+  assert.equal(options(['--placement-only']).placementOnly,true);
+});
+
+test('producer fingerprints include transitive extraction helpers and locked dependencies, excluding placement consumers',async()=>{
+  const files={'server/amendment-documents.mjs':"import './docx-numbering.mjs';",'server/docx-numbering.mjs':'numbering-v1','package-lock.json':'lock-v1'};
+  const read=async file=>Buffer.from(files[file]||'');
+  const before=await producerFingerprint(read);
+  assert(Object.hasOwn(before.files,'server/document-context.mjs'));assert(!Object.hasOwn(before.files,'server/proposal-placement.mjs'));
+  files['server/docx-numbering.mjs']='changed-without-version-bump';
+  assert.notEqual((await producerFingerprint(read)).sha256,before.sha256);
+  files['server/docx-numbering.mjs']='numbering-v1';files['package-lock.json']='lock-v2';
+  assert.notEqual((await producerFingerprint(read)).sha256,before.sha256);
+});
+
+test('cached-source CLI reports correct-to-false regression despite live wrapper incompatibility',async t=>{
+  const directory=await mkdtemp(path.join(os.tmpdir(),'amendment-bench-placement-gate-'));
+  t.after(()=>rm(directory,{recursive:true,force:true}));
+  const inputs=path.join(directory,'inputs');await mkdir(inputs);
+  const document='B-10-2026-0001',id=document+'-AM-1',listId=document+'-AM-001-001',url='https://data.europarl.europa.eu/distribution/test/insert.docx';
+  const cell=value=>'<w:tc>'+paragraph(value)+'</w:tc>',tr=(a,b)=>'<w:tr>'+cell(a)+cell(b)+'</w:tr>';
+  const body=docx('<w:document xmlns:w="urn:word"><w:body>'+paragraph('<Amend><Date>1.10.2026</Date><NumAm>1</NumAm>')+paragraph('<Article>Paragraph 3 c (new)</Article>')+'<w:tbl>'+tr('Motion for a resolution','Amendment')+tr('','New paragraph.')+'</w:tbl>'+paragraph('</Amend>')+'</w:body></w:document>');
+  const indexed={id,targetDocumentId:document,number:1,listId,language:'en',wordingSource:{url},decisions:[{id:'decision-1',date:'2026-10-22',sittingId:'MTG-PL-2026-10-22',amendmentIds:[id],source:{url:'https://data.europarl.europa.eu/api/v2/example',fetchedAt:'2026-10-23T00:00:00Z'}}]};
+  const query=new URLSearchParams({limit:'50',offset:'0',lang:'en',document});
+  const context={version:5,documentId:document,document:{selectedText:source(['The European Parliament,','3. Three.','4. Four.','3b. Misordered.','5. Five.','ANNEX'])}};
+  const rawUrl='https://data.europarl.europa.eu/distribution/test/body-gate.docx';
+  const rawBody=docx('<w:document xmlns:w="urn:word"><w:body>'+context.document.selectedText.paragraphs.map(paragraph).join('')+'</w:body></w:document>');
+  const rawWork={id:'eli/dl/doc/'+document,identifier:document,work_type:'def/ep-document-types/RESOLUTION_MOTION',is_realized_by:[{language:'http://publications.europa.eu/resource/authority/language/ENG',is_embodied_by:[{format:'http://publications.europa.eu/resource/authority/file-type/DOCX',is_exemplified_by:rawUrl}]}]};
+  for(const [input,value] of [[rawUrl,rawBody],['https://data.europarl.europa.eu/api/v2/plenary-documents/'+document+'?format=application%2Fld%2Bjson',{data:[rawWork]}],[apiBase+'/api/amendments?'+query,{total:1,offset:0,limit:50,coverage:{servingGeneration:5},items:[indexed]}],[url,body],[contextUrl(apiBase,document,'en'),context],[contextUrl(apiBase,document,'en',indexed,indexed),context]]) {
+    const bytes=Buffer.isBuffer(value)?value:Buffer.from(JSON.stringify(value));
+    const request=input.includes('/api/v2/plenary-documents/')?{accept:'application/ld+json'}:null;
+    const key=digest(request?JSON.stringify([input,request]):input);
+    await writeFile(path.join(inputs,key+'.body'),bytes);
+    await writeFile(path.join(inputs,key+'.json'),JSON.stringify({url:input,fetchedAt:'2026-10-27T00:00:00Z',status:200,ok:true,bytes:bytes.length,sha256:digest(bytes),error:null,...(request?{request}:{} )}));
+  }
+  await writeFile(path.join(directory,'snapshot.json'),JSON.stringify({schemaVersion:3,apiBase,asOf:'2026-10-27'}));
+  const args=['scripts/amendment-benchmark.mjs','--api-base',apiBase,'--cache-dir',directory,'--document',document,'--placement-only'];
+  const run=async extra=>{
+    try {await execFileAsync(t,process.execPath,[...args,...extra],{cwd:fileURLToPath(new URL('../',import.meta.url)),maxBuffer:2*1024*1024});assert.fail('false placement must fail the CLI');}
+    catch(error){assert.equal(error.code,1,error.stderr);assert(error.stdout,error.stderr);return JSON.parse(error.stdout);}
+  };
+  const first=await run([]),baseline=JSON.parse(await readFile(first.jsonPath,'utf8'));
+  assert.equal(baseline.rows[0].outcome,'false-placement');
+  baseline.rows[0].outcome='correct';baseline.rows[0].reason='oracle-verified';baseline.metrics=metrics(baseline.rows);
+  const baselinePath=path.join(directory,'baseline.json');await writeFile(baselinePath,JSON.stringify(baseline));
+  const result=await run(['--baseline',baselinePath]);
+  assert.equal(result.scope,'full-pipeline-cached-sources');assert.equal(result.acquisition.requests,0);
+  assert.equal(result.comparison.failed,true);assert.equal(result.comparison.refused,undefined);
+  assert.deepEqual(result.comparison.regressions.map(row=>[row.id,row.before,row.after]),[[id,'correct','false-placement']]);
+});
+
+
+test('independent raw extent oracle rejects insertions after a bold subheading and both closing-separator shapes',()=>{
+  for(const {targetLabel,rows,formats,badAfter} of [
+    {targetLabel:'Paragraph 216 a (new)',rows:['216. Last paragraph.','European Development Funds (EDF)','217. Next paragraph.','ANNEX'],formats:{1:{marks:[{kind:'bold',start:0,end:32}]}},badAfter:2},
+    {targetLabel:'Paragraph 132 a (new)',rows:['132. Last paragraph.','°','°\t°','133. Forwarding instruction.','ANNEX'],formats:{},badAfter:3},
+    {targetLabel:'Paragraph 132 b (new)',rows:['132. Last paragraph.','°','°\t°','133. Forwarding instruction.','ANNEX'],formats:{},badAfter:3},
+  ]) {
+    const text=source(['The European Parliament,',...rows]);text.paragraphFormats=text.paragraphs.map((_,i)=>formats[i-1]||{});
+    const amendment={...wording(targetLabel),baseline:'motion-resolution'};
+    const placement={status:'placed',operation:'insert',insertAfter:badAfter,insertBefore:badAfter+1,evidence:[]};
+    const checked=verifyPlacement({placement,wording:amendment,text});
+    assert.equal(checked.status,'failed',targetLabel);assert.equal(checked.reason,'oracle-insertion-boundary-mismatch');
+    assert.equal(verifyPlacement({placement:{...placement,insertAfter:1,insertBefore:2},wording:amendment,text}).status,'verified');
+  }
+});
+
+test('raw extent oracle includes continuation rows, stops at section headings and withholds uncertain extents',()=>{
+  const amendment={...wording('Paragraph 1 a (new)'),baseline:'motion-resolution'};
+  const placement={status:'placed',operation:'insert',insertAfter:2,insertBefore:3,evidence:[]};
+  for(const boundary of ['SECTION II','ANNEX I','EXPLANATORY STATEMENT']) {
+    const text=source(['The European Parliament,','1. Opening paragraph;','continued wording;',boundary,'2. Another section.']);
+    assert.equal(verifyPlacement({placement,wording:amendment,text}).status,'verified');
+  }
+  const multi=source(['The European Parliament,','2. Earlier decision.','ANNEX','The European Parliament,','1. Opening paragraph;','continued wording;','SECTION II','2. Another section.']);
+  assert.equal(verifyPlacement({placement:{...placement,insertAfter:5,insertBefore:6},wording:amendment,text:multi}).status,'verified');
+  const uncertain=source(['The European Parliament,','1. Opening paragraph;','Unformatted title','2. Next.','ANNEX']);
+  assert.equal(verifyPlacement({placement,wording:amendment,text:uncertain}).status,'unverified');
+  const missing=source(['The European Parliament,','1. Opening paragraph;','continuation;']);
+  assert.equal(verifyPlacement({placement,wording:amendment,text:missing}).status,'unverified');
+  const replace={...amendment,targetLabel:'Paragraph 1',originalText:'Opening paragraph;\nSECTION II'};
+  const span={status:'placed',operation:'replace',span:{start:1,end:2}};
+  const text=source(['The European Parliament,','1. Opening paragraph;','SECTION II','2. Another section.']);
+  assert.equal(verifyPlacement({placement:span,wording:replace,text}).reason,'oracle-address-span-mismatch');
+});
+
+test('producer guard refuses empty-projection wrapper probe and source-selection changes, allowing version/consumer-only changes',async()=>{
+  const root=fileURLToPath(new URL('../',import.meta.url));
+  const read=file=>readFile(path.join(root,file));
+  const before=await producerFingerprint(read);
+  for(const file of ['server/document-context.mjs','server/proposal-baseline.mjs','server/commission-proposal-identity.mjs','server/cellar-documents.mjs'])assert(Object.hasOwn(before.files,file),file);
+  assert(!Object.hasOwn(before.files,'server/proposal-matching.mjs'));
+  const edited=transform=>producerFingerprint(async file=>transform(file,(await read(file)).toString()));
+  const version=await edited((file,text)=>file==='server/document-context.mjs'?text.replace(/DOCUMENT_CONTEXT_VERSION=\d+/,'DOCUMENT_CONTEXT_VERSION=7'):text);
+  assert.deepEqual(version,before,'only the wrapper version literal is waived');
+  const empty=await edited((file,text)=>{
+    if(file!=='server/document-context.mjs')return text;
+    const changed=text.replace('baseline,proposal,documentId:query.id','baseline,proposal:{items:[]},documentId:query.id').replace(/DOCUMENT_CONTEXT_VERSION=\d+/,'DOCUMENT_CONTEXT_VERSION=7');
+    assert.notEqual(changed,text);assert(changed.includes('proposal:{items:[]}'));return changed;
+  });
+  const wrap=fingerprint=>({sample:{},snapshotId:'same-inputs',inputs:[],code:{producerFingerprint:fingerprint},compatibility:{compatible:false,mismatches:[{kind:'document-context',observed:5,expected:7}]},rows:[row('unchanged')],metrics:metrics([row('unchanged')])});
+  const refused=compareBaseline(wrap(empty),wrap(before),{placementOnly:true});
+  assert.equal(refused.refused,true);assert.equal(refused.failed,true);assert.match(refused.reason,/producers changed/);
+  for(const changedFile of ['server/proposal-baseline.mjs','server/commission-proposal-identity.mjs','server/cellar-documents.mjs']) {
+    const selected=await edited((file,text)=>file===changedFile?text+'\n// changed producer\n':text);
+    assert.equal(compareBaseline(wrap(selected),wrap(before),{placementOnly:true}).refused,true,changedFile);
+  }
+  for(const consumer of ['server/proposal-matching.mjs','server/document-context-model.mjs','server/document-context-placement.mjs'])
+    assert.deepEqual(await edited((file,text)=>file===consumer?text+'\n// changed consumer\n':text),before,consumer);
+});
+
+test('proposal oracle rejects an implicit paragraph extent swallowing a published next paragraph',()=>{
+  const content=source(['Article 3','A subtitle','1. First paragraph:','(a) First point;','Continued lead text.','2. Second paragraph.','Article 4']);
+  content.paragraphProperties[1].styleId='Titrearticle';
+  for(const index of [2,5])content.paragraphProperties[index].styleId='ManualNumPar1';
+  content.paragraphProperties[3].styleId='Point1';
+  const items=[{kind:'act',index:1,proposal:parseProposal(content,{language:'en'})}];
+  const amendment=wording('Article 3 – paragraph 1 a (new)');
+  const correct=resolveProposalPlacement(items,amendment);assert.equal(correct.insertBefore,5);
+  assert.equal(verifyPlacement({placement:correct,wording:amendment,items}).status,'verified');
+  // Corrupt the producer's tree as in the real unstyled-subtitle case. This
+  // fixture remains a negative oracle test after the production parser is fixed.
+  const broken=structuredClone(items),article=broken[0].proposal.units.flatMap(unit=>unit.children||[]).find(unit=>unit.kind==='article'&&unit.label.number===3);
+  const first=article.children.find(unit=>unit.kind==='paragraph'&&unit.label.number===1);
+  const second=article.children.find(unit=>unit.kind==='paragraph'&&unit.label.number===2);
+  first.implicit=true;first.extent.end=second.extent.end;
+  article.children=article.children.filter(unit=>unit!==second);
+  second.kind='point';second.label={...second.label,kind:'point'};second.path=[...first.path,second.label];first.children.push(second);
+  const placement={...correct,insertAfter:first.extent.end-1,insertBefore:first.extent.end};
+  const checked=verifyPlacement({placement,wording:amendment,items:broken});
+  assert.equal(checked.status,'failed');assert.equal(checked.reason,'oracle-published-paragraph-boundary-mismatch');
+  assert.equal(classify({...stages(),S5:placement,S6:checked}).outcome,'false-placement');
+});
+
+test('present-text instruction frames assert only new numbered proposal instructions',()=>{
+  const wording=(raw,proposedText,language='en',proposal=[])=>({baseline:'present-text',language,targetLabel:raw,targetPath:{proposal,underlying:[{document:'Regulation (EU) 2024/1689',raw:'Article 6 – paragraph 1'}]},originalText:'1. Present law;',proposedText});
+  const framed=instructionFrameWording(wording('Article 1 – paragraph 1 – point 5 b (new)','(5b)\tArticle 6(1) is amended as follows:'));
+  assert.equal(framed.baseline,'commission-proposal');assert.equal(framed.originalText,'');assert.deepEqual(framed.targetPath.underlying,[]);
+  assert.equal(framed.targetLabel,'Article 1 – paragraph 1 – point 5 b (new)');
+  assert(instructionFrameWording(wording('Article 1 – paragraph 1 – point 2 a (new)\nRegulation (EU) 2024/1689 — Article 2 – paragraph 8','(2 a)\tin Article 2, paragraph 8 is replaced:')));
+  assert(instructionFrameWording(wording('Article 1 – paragraph 1 – point -1','(-1)\tin Article 10a, paragraph 1 is replaced:')));
+  assert(instructionFrameWording(wording('Article 1 a (new)','Article 1 a (new)\n"In Article 1 of Decision (EU) 2015/1814:')));
+  // The complete printed article number must match ('1 bis' is not '1 bis bis').
+  assert(instructionFrameWording(wording('Article 1 bis (nouveau)','Article 1 bis (nouveau)\nÀ l’article 1:','fr')));
+  assert.equal(instructionFrameWording(wording('Article 1 bis (nouveau)','Article 1 bis bis (nouveau)\nÀ l’article 1:','fr')),null);
+  assert.equal(instructionFrameWording(wording('Article 1 a (new)','Article 1 ab (new)\nIn Article 1:')),null);
+  // Nested points are outside the outer-level rule, whatever their numbering.
+  assert.equal(instructionFrameWording(wording('Article 1 – paragraph 1 – point 5 – point 1 a (new)','(1a)\tNew nested point')),null);
+  assert.equal(instructionFrameWording(wording('Article 1 – paragraph 1 – point 5 – point b a (new)','(ba)\tNew nested point')),null);
+  assert.equal(instructionFrameWording(wording('Article 1 – point 5 b (new)','(5b)\tArticle 6(1) is amended:')),null);
+  assert(instructionFrameWording(wording('Artykuł 1 – akapit 1 – punkt 6 b (nowy)','6b)\tart. 12 otrzymuje brzmienie:','pl')));
+  for(const value of [
+    wording('Article 1 – paragraph 1 – point 5 b (new)','(5c)\tArticle 6(1) is amended as follows:'),
+    wording('Article 1 – paragraph 1 – point 5','(5)\tArticle 6(1) is amended as follows:'),
+    wording('Regulation (EU) 2024/1689 — Article 6 – paragraph 1','(5b)\tArticle 6(1) is amended:'),
+    wording('Artykuł 1 – akapit 1 – punkt 6 a – litera a (nowa)','6a)\tw art. 11 wprowadza się następujące zmiany:','pl'),
+    {...wording('Article 1 – paragraph 1 – point 5 b (new)','(5b)\tArticle 6(1) is amended:'),baseline:'commission-proposal'},
+    wording('Article 1 – paragraph 1 – point 5 b (new)','(5b)\tArticle 6(1) is amended:','en',[{raw:'Article 1 – paragraph 1 – point 5 b (new)'},{raw:'Article 2'}]),
+  ])assert.equal(instructionFrameWording(value),null,value.targetLabel+' / '+value.proposedText);
+});
+
+test('replay reads the proposal frame only when the law does not place the instruction',async()=>{
+  const frame={baseline:{language:'en',status:'available'},items:[{kind:'act'}]};
+  const placed={status:'placed',operation:'replace'},unresolved={status:'unresolved',reason:'existing-law-target-unavailable'},framed={status:'placed',operation:'insert',frame:'commission-proposal'};
+  const run=async({law,matching,eligible=true,proposal=framed,available=frame})=>{const reads=[];const result=await placeWithInstructionFrame({eligible,matching,language:'en',
+    place:items=>items?proposal:law,readFrame:async()=>{reads.push(1);return available;}});return {...result,reads:reads.length};};
+  // A placed existing-law amendment needs no proposal read.
+  assert.deepEqual(await run({law:placed,matching:true}),{placement:placed,frame:null,reads:0});
+  // An available law that cannot place the instruction falls back, like the endpoint.
+  assert.deepEqual(await run({law:unresolved,matching:true}),{placement:framed,frame,reads:1});
+  // A partial law baseline with matching-language items: the frame still supplies verification inputs.
+  assert.deepEqual(await run({law:{status:'unresolved',reason:'existing-law-wording-conflict'},matching:true}),{placement:framed,frame,reads:1});
+  // No law at all: the frame or nothing.
+  assert.deepEqual(await run({law:unresolved,matching:false}),{placement:framed,frame,reads:1});
+  assert.deepEqual(await run({law:unresolved,matching:false,proposal:{status:'unresolved',reason:'relative_target_not_found'}}),{placement:{status:'unresolved',reason:'placement-not-evaluated'},frame:null,reads:1});
+  assert.deepEqual(await run({law:unresolved,matching:true,proposal:{status:'unresolved',reason:'relative_target_not_found'}}),{placement:unresolved,frame:null,reads:1},'the law result stands, as at the endpoint');
+  assert.deepEqual(await run({law:unresolved,matching:true,available:{baseline:{language:'fr'},items:[{}]}}),{placement:unresolved,frame:null,reads:1});
+  assert.equal((await run({law:unresolved,matching:true,eligible:false})).reads,0);
+});
+
+test('NLE reports never read the proposal frame, as at the endpoint',async()=>{
+  const {array}=await import('../server/activity-index-model.mjs'),{commissionProcedures}=await import('../server/commission-proposal-identity.mjs');
+  const runtime={array,commissionProcedures};
+  const work=title=>({is_realized_by:[{title_alternative:{en:[title]}}]});
+  assert.equal(nleReport(work('REPORT on the draft Council decision (2025/0123(NLE))'),[],runtime),true);
+  assert.equal(nleReport(work('REPORT on the proposal (2025/0359(COD))'),[{field:'DocRef',raw:'(COM(2025)0836 – C10-0304/2025 – 2025/0359(COD))'}],runtime),false);
+  assert.equal(nleReport(work('REPORT'),[{field:'DocRef',raw:'(2025/0123(NLE))'}],runtime),true);
+});
+
+test('oracle places an insertion after a provision merged into its predecessor row before the next neighbour',()=>{
+  const text=source(['The European Parliament,','– having regard to its rules,','K.\twhereas one;L.\twhereas merged;','M.\twhereas two;','N.\twhereas three;','1.\tCalls for action.']);
+  const amendment={...wording('Recital L a (new)','','La.\twhereas new;'),baseline:'motion-resolution'};
+  const placement=operation=>({status:'placed',operation:'insert',...operation});
+  assert.equal(verifyPlacement({placement:placement({insertAfter:2,insertBefore:3}),wording:amendment,text}).reason,'oracle-merged-provision-boundary');
+  assert.equal(verifyPlacement({placement:placement({insertAfter:3,insertBefore:4}),wording:amendment,text}).status,'failed');
+  const absent=source(['The European Parliament,','– having regard to its rules,','K.\twhereas one;','M.\twhereas two;','1.\tCalls for action.']);
+  assert.equal(verifyPlacement({placement:placement({insertAfter:2,insertBefore:3}),wording:amendment,text:absent}).status,'unverified','no printed label, no position');
+  const notAdjacent=source(['The European Parliament,','– having regard to its rules,','K.\twhereas one;L.\twhereas merged;','N.\twhereas three;','1.\tCalls for action.']);
+  assert.equal(verifyPlacement({placement:placement({insertAfter:2,insertBefore:3}),wording:amendment,text:notAdjacent}).status,'unverified');
+  const numbered=source(['The European Parliament,','– having regard to its rules,','A.\twhereas one;','71.\tUrges;72.\tStresses;','73.\tCalls;','74.\tNotes.']);
+  const paragraph={...wording('Paragraph 72 a (new)','','72a.\tRecalls;'),baseline:'motion-resolution'};
+  assert.equal(verifyPlacement({placement:placement({insertAfter:3,insertBefore:4}),wording:paragraph,text:numbered}).reason,'oracle-merged-provision-boundary');
+});
+
+test('adopted-text sidecar is offline-only and requires a zero request cap',()=>{
+ assert.equal(options(['--adopted-text-snapshot','/tmp/sealed','--request-cap','0']).adoptedTextSnapshot,'/tmp/sealed');
+ for(const extra of [[],['--fetch'],['--languages'],['--acquire-only']])assert.throws(()=>options(['--adopted-text-snapshot','/tmp/sealed',...extra]),/offline/);
+});
+
+test('verified whole-document operations earn credit and retain distinct reasons',()=>{
+  const rows=[];
+  for(const [operation,reason] of [['reject','rejection'],['alternative-motion','alternative-motion']]) {
+    const proof={status:'verified',reason:'source-attested-'+reason};
+    const state={...stages(),S5:{status:'document-operation',operation}};
+    const result=classifyRow(state,proof);
+    assert.deepEqual(result,{outcome:'correct',reason:'whole-document-'+reason});
+    assert.notEqual(classifyRow(state,{...proof,status:'unverified'}).outcome,'correct');
+    rows.push({...row(operation),...result});
+  }
+  assert.equal(metrics(rows).eligible,2);
+  assert.equal(metrics(rows).counts.correct,2);
+  assert.equal(metrics(rows).votes.correct,metrics(rows).votes.total);
+});
+
+test('provisional placement uses exact source identity despite unavailable comparison columns',async()=>{
+ const {provisionalFixture}=await import('../server/test-support/provisionalFixture.mjs');
+ const fixture=provisionalFixture(),url=fixture.source.url;
+ const input={id:fixture.id,number:3,targetDocumentId:fixture.documentId,listId:fixture.listId,wordingSource:{url},language:'en',decisions:fixture.decisions.map(d=>({...d,date:'2026-10-22',sittingId:'MTG-PL-2026-10-22'}))};
+ const cache={apiBase,get:async()=>({ok:true,body:fixture.buffer,url,fetchedAt:fixture.source.fetchedAt,sha256:digest(fixture.buffer)}),json:async url=>({input:{ok:true,url},value:{documentId:fixture.documentId,document:{selectedText:source([])}}})};
+ const sample={mode:'documents',asOf:'2026-10-26'};
+ const [result]=await evaluateReport([input],sample,cache);
+ assert.equal(result.stages.S2.status,'blocked');assert.equal(result.outcome,'correct');assert.equal(result.reason,'whole-document-provisional-agreement');assert.equal(result.stages.S5.scope,'whole-document');
+ const [missing]=await evaluateReport([input],sample,{...cache,get:async()=>({ok:false,status:404,url})});assert.notEqual(missing.outcome,'correct');
+ const [oldRuntime]=await evaluateReport([input],sample,cache,{runtime:{}});assert.notEqual(oldRuntime.outcome,'correct','an older runtime must not use the current placement helper');
+});
+
+test('harness identity records oracle modules and rejection vocabulary and detects their mutation',async()=>{
+ const root=fileURLToPath(new URL('../',import.meta.url));
+ const original=await harnessIdentity(root);
+ const protectedFiles=['scripts/amendment-provisional-oracle.mjs','scripts/fixtures/amendment-rejection-sentences.json'];
+ for(const file of protectedFiles)assert.equal(original.files[file],digest(await readFile(path.join(root,file))));
+ const directory=await mkdtemp(path.join(os.tmpdir(),'amendment-harness-fingerprint-'));
+ try {
+  for(const name of Object.keys(original.files)){await mkdir(path.dirname(path.join(directory,name)),{recursive:true});await writeFile(path.join(directory,name),await readFile(path.join(root,name)));}
+  const before=await harnessIdentity(directory);
+  for(const file of protectedFiles) {
+   await writeFile(path.join(directory,file),(await readFile(path.join(directory,file),'utf8'))+'\n');
+   const after=await harnessIdentity(directory);
+   assert.notEqual(before.files[file],after.files[file]);
+  }
+ }finally{await rm(directory,{recursive:true,force:true});}
+});
+
+
+test('list date replay metadata is bound to the exact selected list and language',()=>{
+ const wording={listId:'A-10-2026-0160-AM-001-003',language:'en',documentDate:null};
+ const record={listId:wording.listId,language:'en',listDocumentDate:'2026-06-10'};
+ assert.deepEqual(withListDocumentDate(wording,record),{...wording,listDocumentDate:'2026-06-10'});
+ assert.equal(withListDocumentDate(wording,{...record,listId:'A-10-2026-0160-AM-004-005'}),wording);
+ assert.equal(withListDocumentDate(wording,{...record,language:'fr'}),wording);
+ assert.equal(withListDocumentDate(wording,{}),wording);assert.equal(wording.documentDate,null);
+});

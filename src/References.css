@@ -1,0 +1,34 @@
+.legal-reference-scope {position:relative;}
+:is(.explorer,.explorer-insights,.insight-inline-reader) button.legal-ref {display:inline;min-height:0;padding:0;margin:0;border:0;border-bottom:1.5px dotted currentColor;background:none;color:inherit;font:inherit;line-height:inherit;text-align:inherit;cursor:pointer;overflow-wrap:anywhere;}
+:is(.explorer,.explorer-insights,.insight-inline-reader) button.legal-ref:hover,:is(.explorer,.explorer-insights,.insight-inline-reader) button.legal-ref[aria-expanded="true"] {background:color-mix(in srgb,currentColor 12%,transparent);border-bottom-style:solid;}
+button.legal-ref:focus-visible {outline:3px solid var(--focus);outline-offset:2px;}
+.legal-note-mark {font-size:.7em;line-height:0;margin-left:1px;}
+.legal-note-mark a {text-decoration:none;padding:0 2px;}
+.legal-reference-card {position:absolute;z-index:20;max-height:min(70vh,560px);overflow:auto;overscroll-behavior:contain;padding:16px 40px 14px 16px;background:var(--surface);color:var(--ink);box-shadow:var(--shadow);border:1px solid var(--line);border-top:3px solid var(--accent);border-radius:var(--radius-sm);font-size:15px;line-height:1.45;text-align:left;}
+.legal-reference-scope .legal-reference-card:focus-visible,.legal-reference-scope :is(a,button,select,summary,[tabindex]):focus-visible {outline:3px solid var(--focus);outline-offset:3px;}
+.legal-reference-scope:focus-visible,.legal-reference-question:focus-visible {outline:3px solid var(--focus);outline-offset:4px;}
+.legal-reference-card p {margin:0 0 8px;}
+.legal-reference-kind {font-size:12px;font-weight:bold;letter-spacing:.04em;text-transform:uppercase;color:var(--accent);}
+.legal-reference-title {font-weight:bold;}
+.legal-reference-meta {font-size:13px;color:var(--ink-muted);}
+.legal-reference-actions {display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 4px;}
+.legal-reference-card .legal-reference-actions :is(a,button) {display:inline-flex;align-items:center;min-height:40px;padding:8px 12px;font-size:14px;line-height:1.2;text-decoration:none;background:var(--accent);color:var(--accent-ink);border:0;border-radius:var(--radius-sm);}
+.legal-reference-card .legal-reference-actions .legal-reference-secondary {background:var(--surface-2);color:var(--ink);}
+.legal-reference-card .legal-reference-actions button[aria-expanded="true"] {background:var(--accent-soft);color:var(--ink);}
+.legal-reference-card button.legal-reference-close {position:absolute;top:6px;right:6px;width:32px;min-width:0;height:32px;min-height:0;padding:0;font-size:22px;line-height:1;background:none;color:var(--ink);}
+.legal-reference-summary {margin-top:10px;padding-top:10px;border-top:1px solid var(--line);}
+.legal-reference-summary h4 {margin:10px 0 4px;font-size:14px;}
+.legal-reference-summary p {font-size:14px;}
+:is(.explorer,.explorer-insights,.insight-inline-reader) button.legal-reference-text-button {min-height:0;padding:0;background:none;color:inherit;text-decoration:underline;font:inherit;}
+.legal-reference-question {margin-top:12px;}
+.legal-reference-retry {font-size:13px;line-height:1.5;margin:10px 0;}
+.legal-reference-retry button.legal-reference-text-button {min-height:36px;padding:4px 0;}
+.legal-reference-question > button.legal-reference-text-button {font-size:14px;}
+.legal-notes {margin:14px 0 6px;padding-top:8px;border-top:1px solid color-mix(in srgb,currentColor 25%,transparent);font-size:14px;line-height:1.5;max-width:78ch;}
+.legal-notes summary {cursor:pointer;font-weight:bold;}
+.legal-notes ol {margin:8px 0 0;padding-left:26px;}
+.legal-notes li {margin-bottom:6px;overflow-wrap:anywhere;scroll-margin-top:12px;}
+.legal-notes li:target {background:color-mix(in srgb,var(--accent-soft) 30%,transparent);}
+@media(max-width:560px) {.legal-reference-card {font-size:14px;max-height:65vh;}}
+/* The superscript wrapper uses zero line height; the button needs room below its number for the border. */
+:is(.explorer,.explorer-insights,.insight-inline-reader) button.legal-note-ref {padding:0 2px;border-bottom-width:1px;line-height:normal;}

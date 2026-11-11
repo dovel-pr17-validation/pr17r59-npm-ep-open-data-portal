@@ -1,0 +1,633 @@
+import {pruneAmendmentGenerations} from './generation-prune.mjs';
+import {upcomingScopeContext,upcomingAgenda,upcomingSource,scheduledVotes,withScheduledVotes} from './upcoming-amendments.mjs';
+import {fastReadsReady} from './fast-read-projections.mjs';
+import {languagePreference} from './language-order.mjs';
+import { createHash } from 'node:crypto';
+import {HttpError} from './http-utils.mjs';
+import { AMENDMENTS_API_VERSION, AMENDMENT_LIMITS, PROPOSER_DATE_BASES, AMENDMENT_OUTCOME_PROOF_VERSION, AMENDMENT_DISTRIBUTION_PROOF_VERSION, AMENDMENT_EMPTY_OBSERVATION_VERSION, SPLIT_BINDING_GAP, amendmentRowOutcome, checkedAmendmentBindings, resolvedAmendmentAuthorId, amendmentTextLosses, validAmendmentFormatting, amendmentProposerDate, checkedAggregateAttribution, amendmentReference, amendmentTarget, canonicalEPReference } from './amendments.mjs';
+import { AMENDMENT_EXTRACTION_VERSION } from './amendment-documents.mjs';
+import { SPLIT_PARSER_VERSION } from './amendment-splits.mjs';
+import { AMENDMENT_LINKS_VERSION } from './activity-index-model.mjs';
+import {committeeAmendmentReference,committeeScopeKey} from './committee-amendments.mjs';
+import {copyProjectedGenerationRows,updateGenerationRows} from './generation-copy.mjs';
+const parse=value=>JSON.parse(value);
+export const amendmentLinkIndexVersion=1;
+export const amendmentParserUpgradeKey='amendment:parser-upgrade';
+export const amendmentParserSourceRevisionKey='amendment:parser-source-revision';
+const amendmentLinkInvalidationWhere="json_type(body,'$.amendmentLinksVersion') IS NOT NULL AND kind='document' AND (json_extract(body,'$.work_type') LIKE '%/REPORT_PLENARY' OR json_extract(body,'$.work_type') LIKE '%/RESOLUTION_MOTION' OR json_extract(body,'$.work_type') LIKE '%/RESOLUTION_MOTION_JOINT')";
+export function amendmentLinkIndexes(db) {
+  db.exec('CREATE INDEX IF NOT EXISTS amendment_link_invalidation ON sources(generation,key) WHERE '+amendmentLinkInvalidationWhere);
+}
+export function invalidateAmendmentLinks(store,generation) {
+  store.assertWriter();
+  // Repeated overflow must seek only remaining markers, including any restored
+  // by a source refresh, rather than reparsing every retained source body.
+  return updateGenerationRows(store.db,{table:'sources',key:'key',indexedBy:'amendment_link_invalidation',where:amendmentLinkInvalidationWhere,set:"body=json_remove(body,'$.amendmentLinksVersion')"},generation);
+}
+const wordingUpgradeGap='Amendment wording is unverified until the current document parser refreshes its source.';
+const proposerDateGap='The amendment proposer date is unavailable; author identities cannot be checked against a mandate.';
+const sourceFreshnessGap='Some amendment wording source distributions are pending, unverified or failed; retained wording is labelled.';
+const checkedLabel=record=>({targetLabelLanguage:record.targetLabel?record.targetLabelLanguage ?? null:null,targetLabelSource:record.targetLabel?record.targetLabelSource ?? null:null});
+const checkedTargetTopics=record=>[...(record.topics || []).filter(topic=>topic.basis!=='target'),...(record.targetLabel?[{id:'target:'+record.targetLabel,label:record.targetLabel,basis:'target',language:record.targetLabelLanguage ?? null,source:record.targetLabelSource ?? null}]:[])];
+function checkedProposer(record) {
+  const date=amendmentProposerDate(record);
+  return {...record,proposerDate:date?.date || null,proposerDateBasis:date?.basis || null,
+    authors:(record.authors || []).map(author=>date?resolvedAmendmentAuthorId(author)?author:{...author,personId:null,method:null,status:author.status || 'unverified'}:{...author,personId:null,method:null,status:'missing_proposer_date',evidence:[]}),
+    gaps:[...new Set([...(record.gaps || []),...(!date&&record.authors?.length?[proposerDateGap]:[])])]};
+}
+function checkedAmendmentRead(record) {
+  record=checkedAggregateAttribution(record);
+  const row=checkedAmendmentBindings({...checkedProposer(record),...checkedLabel(record)});
+  if((record.listId || record.textParserVersion!=null || typeof record.originalText==='string' || typeof record.proposedText==='string')&&record.textParserVersion!==AMENDMENT_EXTRACTION_VERSION) {
+    row.baseline='unknown';row.baselineSource=null;row.documentReferences=[];row.targetPath=null;
+    row.originalText=null;row.proposedText=null;row.originalFormatting=[];row.proposedFormatting=[];row.textIntegrity='incomplete';row.wordingRetained=false;
+    row.gaps=[...new Set([...row.gaps,wordingUpgradeGap])];
+  }
+  if(!validAmendmentFormatting(row)) {
+    row.originalText=null;row.proposedText=null;row.originalFormatting=[];row.proposedFormatting=[];row.textIntegrity='incomplete';row.wordingRetained=false;
+    row.gaps=[...new Set([...row.gaps,'Vertical formatting cannot be tied to exact wording offsets; its wording is withheld.'])];
+  }
+  if(record.listId || typeof record.originalText==='string' || typeof record.proposedText==='string') {
+    row.sourceFreshness=record.sourceFreshness?.version===AMENDMENT_DISTRIBUTION_PROOF_VERSION?record.sourceFreshness:{...(record.sourceFreshness || {descriptor:null,sourceDescriptor:null}),version:AMENDMENT_DISTRIBUTION_PROOF_VERSION,status:'unverified',distributionState:'unknown'};
+    if(row.sourceFreshness.status!=='fresh') {
+      row.wordingRetained=row.textParserVersion===AMENDMENT_EXTRACTION_VERSION&&row.textIntegrity!=='incomplete'&&typeof row.originalText==='string'&&typeof row.proposedText==='string';
+      row.gaps=[...new Set([...row.gaps,sourceFreshnessGap])];
+    }
+  }
+  if(record.variants)row.variants=record.variants.map(checkedAmendmentRead);
+  if(record.targetDocumentId || record.topics)row.topics=checkedTargetTopics(row);
+  row.outcome=amendmentRowOutcome(row);
+  return {...row,scope:row.scope || 'plenary'};
+}
+// Apply only to checked read records: proposer dates and variant attribution have
+// already passed the same guards used by the member-filtered catalogue query.
+export function amendmentAuthorMatch(record,member) {
+  const memberId=String(member);
+  const matches=value=>!value.conflicted&&Boolean(amendmentProposerDate(value))&&(value.authors || []).some(author=>resolvedAmendmentAuthorId(author)===memberId);
+  const aggregateMatched=matches(record),variants=(record.variants || []).filter(matches);
+  const matched=aggregateMatched||variants.length>0;
+  return {memberId,matched,aggregateMatched,basis:matched?aggregateMatched?variants.length?'aggregate-and-variant':'aggregate':'variant':null,
+    variantListIds:[...new Set(variants.map(variant=>variant.listId).filter(Boolean))]};
+}
+function supportedProposerDateSql(body) {
+  const value=field=>`json_extract(${body},'$.${field}')`,date=value('proposerDate'),document=value('documentDate'),list=value('listDocumentDate');
+  const valid=expression=>`(typeof(${expression})='text' AND ${expression} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' AND date(${expression},'+0 days')=${expression})`;
+  const bases=PROPOSER_DATE_BASES.map(basis=>"'"+basis+"'").join(',');
+  return `(COALESCE(${value('proposerDateConflict')},0)=0 AND COALESCE((${valid(date)} AND (${value('proposerDateBasis')} IN (${bases}) OR (${valid(document)} AND ${date}=${document}) OR (${valid(list)} AND ${date}=${list}))) OR (${date} IS NULL AND COALESCE(${value('proposerRetained')},0)=0 AND (${valid(document)} OR ${valid(list)})),0))`;
+}
+const incompatibleWordingSql=body=>`((json_extract(${body},'$.listId') IS NOT NULL OR json_extract(${body},'$.textParserVersion') IS NOT NULL OR json_type(${body},'$.originalText')='text' OR json_type(${body},'$.proposedText')='text') AND COALESCE(json_extract(${body},'$.textParserVersion'),'')<>?)`;
+const unverifiedSourceSql=body=>`((json_extract(${body},'$.listId') IS NOT NULL OR json_type(${body},'$.originalText')='text' OR json_type(${body},'$.proposedText')='text') AND (COALESCE(json_extract(${body},'$.sourceFreshness.version'),0)<>${AMENDMENT_DISTRIBUTION_PROOF_VERSION} OR COALESCE(json_extract(${body},'$.sourceFreshness.status'),'unverified')<>'fresh'))`;
+const splitUnverifiedSql=body=>`(EXISTS(SELECT 1 FROM json_each(${body},'$.decisions') AS vote WHERE json_extract(vote.value,'$.partId') IS NOT NULL OR json_extract(vote.value,'$.partNumber') IS NOT NULL OR json_extract(vote.value,'$.componentBinding') IS NOT NULL OR json_array_length(json_extract(vote.value,'$.componentReferences'))>0) AND (COALESCE(json_extract(${body},'$.outcomeProofVersion'),0)<>${AMENDMENT_OUTCOME_PROOF_VERSION} OR COALESCE(json_extract(${body},'$.splitCoverageComplete'),0)<>1 OR COALESCE(json_array_length(json_extract(${body},'$.splitCoverage')),0)=0 OR EXISTS(SELECT 1 FROM json_each(${body},'$.splitCoverage') AS proof WHERE COALESCE(json_extract(proof.value,'$.complete'),0)<>1) OR EXISTS(SELECT 1 FROM json_each(${body},'$.decisions') AS vote WHERE json_extract(vote.value,'$.componentBinding') IN ('unresolved-collective','unverified'))))`;
+const memberMatchesSql=body=>`(COALESCE(json_extract(${body},'$.conflicted'),0)=0 AND ${supportedProposerDateSql(body)} AND EXISTS(SELECT 1 FROM json_each(${body},'$.authors') AS author WHERE json_extract(author.value,'$.status')='resolved' AND CAST(json_extract(author.value,'$.personId') AS TEXT) IN (?,?)))`;
+
+export const committeeAmendmentIndexVersion=1;
+// Added after version 1 shipped. Without it, each deleted or updated amendment
+// scans the generation's contributors. Separate from the version above, whose
+// upgrade replays every retained amendment.
+export const amendmentContributorIdentityIndexVersion=1;
+export function prepareAmendmentContributorIdentityIndex(db) {
+  db.exec('CREATE INDEX IF NOT EXISTS amendment_contributor_identity ON amendment_contributors(generation,amendment_id,person_id)');
+}
+// These projections are populated under the ordinary writer lease. Reads seek
+// by exact dossier/person/date and never fan out through amendment bodies.
+export function prepareCommitteeAmendmentIndexes(db) {
+  db.exec(`CREATE TABLE IF NOT EXISTS amendment_contributors(generation INTEGER,amendment_id TEXT,person_id TEXT,scope TEXT,proposer_date TEXT,procedure_id TEXT,contribution_date TEXT,source TEXT,list_id TEXT,PRIMARY KEY(generation,procedure_id,person_id,amendment_id,proposer_date));
+    CREATE INDEX IF NOT EXISTS amendment_contributor_identity ON amendment_contributors(generation,amendment_id,person_id);
+    CREATE INDEX IF NOT EXISTS amendment_contributor_procedure ON amendment_contributors(generation,procedure_id,scope,proposer_date,amendment_id,person_id);
+    CREATE TABLE IF NOT EXISTS amendment_procedure_targets(generation INTEGER,procedure_id TEXT,target TEXT,scope TEXT,list_id TEXT,PRIMARY KEY(generation,procedure_id,target));
+    CREATE TABLE IF NOT EXISTS committee_document_procedures(generation INTEGER,procedure_id TEXT,source_key TEXT,PRIMARY KEY(generation,procedure_id,source_key));
+    CREATE INDEX IF NOT EXISTS committee_document_source ON committee_document_procedures(generation,source_key);
+    CREATE INDEX IF NOT EXISTS amendment_procedure_scope ON amendment_procedure_targets(generation,procedure_id,scope,target);
+    CREATE INDEX IF NOT EXISTS committee_preparation ON sources(generation,kind,key) WHERE kind IN ('procedure','document');
+    CREATE INDEX IF NOT EXISTS committee_list_scope ON sources(generation,json_extract(body,'$.scopeKey')) WHERE kind='amendment-list';`);
+  const contributors=(row,from='')=>`SELECT ${row}.generation,${row}.id,replace(CAST(json_extract(author.value,'$.personId') AS TEXT),'person/',''),COALESCE(json_extract(${row}.body,'$.scope'),'plenary'),
+    COALESCE(json_extract(record.body,'$.proposerDate'),json_extract(record.body,'$.documentDate'),json_extract(record.body,'$.listDocumentDate')),procedure.value,
+    MAX(COALESCE(json_extract(record.body,'$.proposerDate'),json_extract(record.body,'$.documentDate'),json_extract(record.body,'$.listDocumentDate')),COALESCE(json_extract(record.body,'$.listDocumentDate'),json_extract(record.body,'$.proposerDate'),json_extract(record.body,'$.documentDate')),COALESCE(json_extract(${row}.body,'$.tabling.date'),json_extract(record.body,'$.proposerDate'),json_extract(record.body,'$.documentDate'),json_extract(record.body,'$.listDocumentDate'))),
+    COALESCE(json_extract(record.body,'$.proposerSource'),json_extract(record.body,'$.metadataSource')),COALESCE(json_extract(record.body,'$.listId'),json_extract(${row}.body,'$.listId'))
+    FROM ${from}(SELECT ${row}.body AS body UNION ALL SELECT value FROM json_each(${row}.body,'$.variants')) record,
+      json_each(COALESCE(json_extract(record.body,'$.procedureIds'),json_extract(${row}.body,'$.procedureIds'))) procedure,json_each(record.body,'$.authors') author
+    WHERE COALESCE(json_extract(record.body,'$.conflicted'),0)=0 AND ${supportedProposerDateSql('record.body')}
+      AND json_extract(author.value,'$.status')='resolved' AND replace(CAST(json_extract(author.value,'$.personId') AS TEXT),'person/','') GLOB '[1-9]*'
+      AND replace(CAST(json_extract(author.value,'$.personId') AS TEXT),'person/','') NOT GLOB '*[^0-9]*'
+      AND COALESCE(json_extract(${row}.body,'$.contributionKind'),'tabled-amendment')='tabled-amendment'
+      AND COALESCE(json_extract(${row}.body,'$.identityConflict'),0)=0 AND CAST(replace(CAST(json_extract(author.value,'$.personId') AS TEXT),'person/','') AS INTEGER)<=9007199254740991`;
+  const targets=(row,from='')=>`SELECT ${row}.generation,procedure.value,${row}.id,COALESCE(json_extract(${row}.body,'$.scope'),'plenary'),json_extract(${row}.body,'$.listId') FROM ${from}json_each(${row}.body,'$.procedureIds') procedure`;
+  const revision="INSERT INTO meta(key,value) VALUES ('amendmentMutationRevision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT);";
+  for(const [table,prefix,projection,identity] of [['amendments','amendment_contributor',contributors,'amendment_id'],['amendment_targets','amendment_procedure',targets,'target']]) {
+    const destination=table==='amendments'?'amendment_contributors':'amendment_procedure_targets';
+    for(const event of ['INSERT','UPDATE','DELETE']) {
+      const name=prefix+'_'+event.toLowerCase();db.exec('DROP TRIGGER IF EXISTS '+name);
+      db.exec(`CREATE TRIGGER ${name} AFTER ${event} ON ${table} BEGIN
+        DELETE FROM ${destination} WHERE generation=${event==='INSERT'?'NEW':'OLD'}.generation AND ${identity}=${event==='INSERT'?'NEW':'OLD'}.id;
+        ${event==='DELETE'?'':'INSERT OR IGNORE INTO '+destination+' '+projection('NEW')+';'} ${revision} END`);
+    }
+    db.exec('DELETE FROM '+destination);
+    // A correlated subquery in FROM is not lateral in SQLite. Replay the same
+    // trigger for each retained row rather than use a separate projection rule.
+    for(const {generation} of db.prepare(`SELECT DISTINCT generation FROM ${table}`).all())updateGenerationRows(db,{table,key:'id',set:'body=body'},generation);
+  }
+  const documents=(row,from='')=>`SELECT ${row}.generation,replace(replace(CASE WHEN ref.type='object' THEN json_extract(ref.value,'$.id') ELSE ref.value END,'https://data.europarl.europa.eu/',''),'http://data.europarl.europa.eu/',''),${row}.key
+    FROM ${from}json_each(${row}.body,'$.inverse_created_a_realization_of') ref WHERE ${row}.kind='document'
+    AND json_extract(${row}.body,'$.work_type') IN ('def/ep-document-types/REPORT_PARLIAMENTARY_COMMITTEE_DRAFT','def/ep-document-types/OPINION_PARLIAMENTARY_COMMITTEE_DRAFT')`;
+  for(const event of ['INSERT','UPDATE','DELETE']) {
+    const name='committee_document_'+event.toLowerCase();db.exec('DROP TRIGGER IF EXISTS '+name);
+    db.exec(`CREATE TRIGGER ${name} AFTER ${event} ON sources BEGIN DELETE FROM committee_document_procedures WHERE generation=${event==='INSERT'?'NEW':'OLD'}.generation AND source_key=${event==='INSERT'?'NEW':'OLD'}.key;
+      ${event==='DELETE'?'':'INSERT OR IGNORE INTO committee_document_procedures '+documents('NEW')+';'} END`);
+  }
+  db.exec('DELETE FROM committee_document_procedures');
+  db.exec('INSERT OR IGNORE INTO committee_document_procedures '+documents('source','sources source,'));
+}
+
+export function amendmentProcedureTargets(store,procedure,{scope='all',committee=null,limit=1001}={}) {
+  const generation=amendmentGeneration(store);
+  return store.db.prepare(`SELECT target.body FROM amendment_procedure_targets link JOIN amendment_targets target ON target.generation=link.generation AND target.id=link.target
+    WHERE link.generation=? AND link.procedure_id=?${scope==='all'?'':' AND link.scope=?'}${committee?" AND EXISTS(SELECT 1 FROM json_each(target.body,'$.committees') committee WHERE json_extract(committee.value,'$.code')=?)":''} ORDER BY link.target LIMIT ?`)
+    .all(generation,procedure,...(scope==='all'?[]:[scope]),...(committee?[committee]:[]),limit).map(row=>parse(row.body));
+}
+
+export function amendmentContributors(store,{procedures,asOf=null,member=null,scope='all',committee=null,limit=2000,offset=0}={}) {
+  if(!procedures?.length)return {items:[],next:null,truncated:false};
+  const generation=amendmentGeneration(store),where=['contributor.generation=?','contributor.procedure_id IN (SELECT value FROM json_each(?))'],args=[generation,JSON.stringify(procedures)];
+  if(asOf){where.push('contributor.contribution_date<=?');args.push(asOf);}
+  if(member){where.push('contributor.person_id=?');args.push(member);}
+  if(scope!=='all'){where.push('contributor.scope=?');args.push(scope);}
+  if(committee){where.push("EXISTS(SELECT 1 FROM json_each(amendment.body,'$.committees') c WHERE json_extract(c.value,'$.code')=?)");args.push(committee);}
+  const rows=store.db.prepare(`SELECT DISTINCT contributor.amendment_id id,contributor.person_id personId,contributor.scope,contributor.proposer_date date,
+      contributor.list_id listId,json_extract(amendment.body,'$.targetDocumentId') targetDocumentId,COALESCE(json_extract(amendment.body,'$.countConflict'),0) countConflict,
+      contributor.source source,json_extract(amendment.body,'$.procedureIds') procedureIds
+    FROM amendment_contributors contributor JOIN amendments amendment ON amendment.generation=contributor.generation AND amendment.id=contributor.amendment_id
+    WHERE ${where.join(' AND ')} ORDER BY contributor.amendment_id,contributor.person_id,contributor.proposer_date LIMIT ? OFFSET ?`).all(...args,limit+1,offset);
+  const truncated=rows.length>limit;
+  return {items:rows.slice(0,limit).map(row=>({...row,source:row.source?parse(row.source):null,procedureIds:row.procedureIds?parse(row.procedureIds):[]})),next:truncated?offset+limit:null,truncated};
+}
+export function amendmentsSchema(db) {
+  db.exec(`CREATE TABLE IF NOT EXISTS amendments (generation INTEGER, id TEXT, target TEXT, date TEXT, outcome TEXT, body TEXT, PRIMARY KEY(generation,id));
+    CREATE INDEX IF NOT EXISTS amendment_target ON amendments(generation,target,date DESC,id);
+    CREATE INDEX IF NOT EXISTS amendment_outcome ON amendments(generation,outcome,date DESC,id);
+    CREATE TABLE IF NOT EXISTS amendment_jobs (generation INTEGER,key TEXT,kind TEXT,body TEXT,priority INTEGER,done INTEGER DEFAULT 0,attempts INTEGER DEFAULT 0,retry_at INTEGER DEFAULT 0,error TEXT,PRIMARY KEY(generation,key));
+    CREATE TABLE IF NOT EXISTS amendment_author_targets (generation INTEGER,name TEXT,target TEXT,PRIMARY KEY(generation,name,target));
+    CREATE TABLE IF NOT EXISTS amendment_member_dependencies (generation INTEGER,person_id TEXT,target TEXT,PRIMARY KEY(generation,person_id,target));
+    CREATE TABLE IF NOT EXISTS amendment_dependency_bootstrap (generation INTEGER PRIMARY KEY,stage TEXT,after_key TEXT,ready INTEGER DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS amendment_member_current (generation INTEGER,target TEXT,PRIMARY KEY(generation,target));
+    CREATE TABLE IF NOT EXISTS amendment_member_pending (generation INTEGER,target TEXT,PRIMARY KEY(generation,target));
+    CREATE TABLE IF NOT EXISTS amendment_targets (generation INTEGER,id TEXT,body TEXT,PRIMARY KEY(generation,id));
+    CREATE TABLE IF NOT EXISTS amendment_split_failures (request_id TEXT,part_id TEXT,language TEXT,body TEXT,PRIMARY KEY(request_id,part_id,language));
+    CREATE INDEX IF NOT EXISTS amendment_list_target ON sources(generation,kind,json_extract(body,'$.targetDocumentId'));`);
+}
+const amendmentReadFlagsSql=body=>`
+    CASE WHEN ${incompatibleWordingSql(body).replaceAll('?',"'"+AMENDMENT_EXTRACTION_VERSION+"'")} OR EXISTS(SELECT 1 FROM json_each(${body},'$.variants') AS variant WHERE ${incompatibleWordingSql('variant.value').replaceAll('?',"'"+AMENDMENT_EXTRACTION_VERSION+"'")}) THEN 1 ELSE 0 END AS wording,
+    CASE WHEN (json_array_length(json_extract(${body},'$.authors'))>0 AND NOT ${supportedProposerDateSql(body)}) OR EXISTS(SELECT 1 FROM json_each(${body},'$.variants') AS variant WHERE json_array_length(json_extract(variant.value,'$.authors'))>0 AND NOT ${supportedProposerDateSql('variant.value')}) THEN 1 ELSE 0 END AS proposer,
+    CASE WHEN ${splitUnverifiedSql(body)} THEN 1 ELSE 0 END AS splits,
+    CASE WHEN ${unverifiedSourceSql(body)} OR EXISTS(SELECT 1 FROM json_each(${body},'$.variants') AS variant WHERE ${unverifiedSourceSql('variant.value')}) THEN 1 ELSE 0 END AS freshness`;
+// Shared by the writer backfill and immutable retained-copy readers.
+export const amendmentReadProjectionSql=`SELECT generation,id,target,${amendmentReadFlagsSql('body')} FROM amendments`;
+export const amendmentReadVersion=createHash('sha256').update(amendmentReadFlagsSql('body')).digest('hex');
+
+// Compact proof flags are derived by the leased writer, once per changed row.
+// They retain the exact full-scope guards without rereading wording on each page.
+export function amendmentReadIndexes(db) {
+  db.exec('CREATE TABLE IF NOT EXISTS amendment_read_flags(generation INTEGER,id TEXT,target TEXT,wording INTEGER,proposer INTEGER,splits INTEGER,freshness INTEGER,PRIMARY KEY(generation,id))');
+  db.exec('CREATE INDEX IF NOT EXISTS amendment_read_scope ON amendment_read_flags(generation,target,wording,proposer,splits,freshness)');
+
+  for(const name of ['insert','update'])db.exec('DROP TRIGGER IF EXISTS amendment_read_'+name);
+  for(const event of ['INSERT','UPDATE OF body,target'])db.exec(`CREATE TRIGGER IF NOT EXISTS amendment_read_${event.split(' ')[0].toLowerCase()} AFTER ${event} ON amendments BEGIN
+    INSERT OR REPLACE INTO amendment_read_flags SELECT NEW.generation,NEW.id,NEW.target,${amendmentReadFlagsSql('NEW.body')}; END`);
+  db.exec('CREATE TRIGGER IF NOT EXISTS amendment_read_delete AFTER DELETE ON amendments BEGIN DELETE FROM amendment_read_flags WHERE generation=OLD.generation AND id=OLD.id; END');
+  db.exec('INSERT OR REPLACE INTO amendment_read_flags '+amendmentReadProjectionSql);
+}
+
+function extensionGeneration(db) {
+  // A newer image can leave a generation partly built. Never adopt or read it, so
+  // that rolling back to this image stays safe.
+  const building=JSON.parse(db.prepare("SELECT value FROM meta WHERE key='generationBegin'").get()?.value??'null')?.generation??-1;
+  // Two ranges keep each MAX an index seek. A generation number is never reused.
+  const newest=['amendments','amendment_targets','amendment_jobs'].flatMap(table=>[`SELECT MAX(generation) generation FROM ${table} WHERE generation>?1`,`SELECT MAX(generation) FROM ${table} WHERE generation<?1`]).join(' UNION ALL ');
+  return db.prepare(`SELECT MAX(generation) AS generation FROM (${newest})`).get(building)?.generation || 0;
+}
+// The generation amendmentsCopy would read from. Active when it can serve reads
+// by itself: a generation being built must never become the reader's fallback.
+export function amendmentSnapshotSource(db,active) {
+  const source=extensionGeneration(db)||active;
+  if(source!==active)return source;
+  return !db.prepare('SELECT 1 FROM amendments WHERE generation=? LIMIT 1').get(active)||db.prepare('SELECT 1 FROM amendment_targets WHERE generation=? LIMIT 1').get(active)?active:null;
+}
+export function amendmentsCopy(db,generation,active,{source=extensionGeneration(db)||active,amendmentsCopied=false}={}) {
+  // Legacy workers advance core generations without knowing these additive
+  // tables. Adopt their last retained extension snapshot before deleting any
+  // rows, including pending page cursors, rather than copying an empty core ID.
+  if(source && source!==generation) {
+    if(!amendmentsCopied)copyProjectedGenerationRows(db,{table:'amendments',key:'id',select:'INSERT OR IGNORE INTO amendments SELECT ?,id,target,date,outcome,body FROM amendments'},generation,source,{replay:source!==active});
+    db.prepare('INSERT OR IGNORE INTO amendment_author_targets SELECT ?,name,target FROM amendment_author_targets WHERE generation=?').run(generation,source);
+    db.prepare('INSERT OR IGNORE INTO amendment_member_dependencies SELECT ?,person_id,target FROM amendment_member_dependencies WHERE generation=?').run(generation,source);
+    db.prepare('INSERT OR IGNORE INTO amendment_dependency_bootstrap SELECT ?,stage,after_key,ready FROM amendment_dependency_bootstrap WHERE generation=?').run(generation,source);
+    db.prepare('INSERT OR IGNORE INTO amendment_member_current SELECT ?,target FROM amendment_member_current WHERE generation=?').run(generation,source);
+    db.prepare('INSERT OR IGNORE INTO amendment_member_pending SELECT ?,target FROM amendment_member_pending WHERE generation=?').run(generation,source);
+    copyProjectedGenerationRows(db,{table:'amendment_targets',key:'id',select:'INSERT OR IGNORE INTO amendment_targets SELECT ?,id,body FROM amendment_targets'},generation,source);
+    db.prepare('INSERT OR IGNORE INTO amendment_jobs SELECT ?,key,kind,body,priority,done,attempts,retry_at,error FROM amendment_jobs WHERE generation=? AND done=0').run(generation,source);
+  }
+  db.prepare('INSERT OR REPLACE INTO meta VALUES (?,?)').run('amendmentSnapshotGeneration',JSON.stringify(generation));
+  if(source!==generation)pruneAmendmentGenerations(db,generation,source || generation);
+}
+
+export function amendmentsPrune(db,generation,old) {
+  pruneAmendmentGenerations(db,generation,old || generation);
+}
+export function recordSplitResults(store,result) {
+  store.assertWriter();
+  const failures=result.failures || [],used=new Set();
+  const entries=(result.parts || []).map(part=>{
+    const failure=failures.find(item=>!used.has(item)&&(part.id!=null?item.partId===part.id:item.partId==null&&item.scope!=='request'&&(item.componentIndex!=null?item.componentIndex===part.componentIndex:item.rawDescription===part.rawDescription)));
+    if(failure)used.add(failure);
+    return {part,failure,kind:'component'};
+  });
+  for(const failure of failures)if(!used.has(failure))entries.push({part:{id:failure.partId,componentIndex:failure.componentIndex,description:failure.description,rawDescription:failure.rawDescription,sourceDescriptions:failure.sourceDescriptions,language:failure.language},failure,kind:failure.partId!=null||failure.scope==='component'?'component':'request'});
+  const requestKey=result.requestId || result.observationKey || '__unidentified_request__:'+createHash('sha256').update(JSON.stringify((result.parts || []).map(part=>[part.componentIndex,part.rawDescription,part.sourceDescriptions]))).digest('hex');
+  if((result.parts || []).length&&!entries.some(entry=>entry.kind==='request')&&store.db.prepare('SELECT 1 FROM amendment_split_failures WHERE request_id=? AND part_id=?').get(requestKey,'__request__'))entries.push({part:{id:null,language:result.parts[0].language},failure:null,kind:'request'});
+  for(const {part,failure,kind} of entries) {
+    const requestId=result.requestId ?? null,language=part.language || 'en';
+    const partId=kind==='request'?null:part.id ?? null;
+    const registryPartKey=kind==='request'?'__request__':partId || '__component__:'+String(part.componentIndex ?? 'unknown')+':'+createHash('sha256').update(JSON.stringify([part.rawDescription ?? part.description ?? null,part.sourceDescriptions || null])).digest('hex');
+    const prior=store.db.prepare('SELECT body FROM amendment_split_failures WHERE request_id=? AND part_id=? AND language=?').get(requestKey,registryPartKey,language);
+    const old=prior?parse(prior.body):null;
+    if(!failure&&!old)continue;
+    if(!old && store.db.prepare('SELECT COUNT(*) AS n FROM amendment_split_failures').get().n>=AMENDMENT_LIMITS.failures) {
+      store.set('amendmentFailureCapacityReached',true);continue;
+    }
+    const sourceField=key=>Object.hasOwn(failure || {},key)?failure[key]:Object.hasOwn(result,key)?result[key]:old?.[key] ?? null;
+    const sourceUrl=sourceField('sourceUrl'),fetchedAt=sourceField('fetchedAt');
+    const at=fetchedAt || new Date(store.clock()).toISOString();
+    const description=String(failure?.description ?? part.description ?? '').slice(0,65537);
+    const rawDescription=typeof (failure?.rawDescription ?? part.rawDescription)==='string'?(failure?.rawDescription ?? part.rawDescription).slice(0,65537):null;
+    const signature=createHash('sha256').update(JSON.stringify({description,rawDescription,sourceDescriptions:failure?.sourceDescriptions || part.sourceDescriptions || null})).digest('hex');
+    const body={...old,...failure,...(rawDescription!=null?{rawDescription}:{}),requestId,registryRequestKey:requestKey,partId,registryPartKey,recordKind:kind,componentIndex:part.componentIndex ?? null,description,language,parserVersion:SPLIT_PARSER_VERSION,
+      sourceUrl,fetchedAt,source:sourceField('source'),sourceCandidates:sourceField('sourceCandidates') || [],provenance:sourceField('provenance'),
+      firstOccurrence:old?.firstOccurrence || at,lastOccurrence:at,originalPartId:partId,count:(old?.count || 0)+(failure?1:0),
+      status:failure?'unresolved':'resolved',code:failure?.code || old?.code || null,reason:failure?.message || old?.reason || null,
+      sourceDescriptionHash:signature,...(!failure?{resolvedAt:at}:{resolvedAt:null}),
+    };
+    store.db.prepare('INSERT OR REPLACE INTO amendment_split_failures VALUES (?,?,?,?)').run(requestKey,registryPartKey,language,JSON.stringify(body));
+  }
+}
+export function saveAmendmentRows(store,generation,target,rows,coverage,{observedDecisionIds=[],freshSplitParts=[],invalidatedTextListIds=[],textParserVersion=null,currentListIds=null,listRelationshipsKnown=null}={}) {
+  store.transaction(()=>{
+    store.assertWriter();
+    const prior=store.db.prepare('SELECT id,date,outcome FROM amendments WHERE generation=? AND target=?').all(generation,target.id);
+    const priorBody=store.db.prepare('SELECT body FROM amendments WHERE generation=? AND target=? AND id=?');
+    const merged=new Map(rows.map(row=>[row.id,row]));
+    const observed=new Set(observedDecisionIds);
+    const invalidatedLists=new Set(invalidatedTextListIds),currentLists=currentListIds===null?null:new Set(currentListIds);
+    const freshParts=new Map(freshSplitParts.map(part=>[part.id,part]));
+    const invalidBaseline=row=>invalidatedLists.has(row.listId)&&row.textParserVersion!==textParserVersion;
+    const extraGaps=new Set();
+    let retained=false;
+    // Copying a generation preserves accepted components. A missing list,
+    // author mapping or decision is a gap, never evidence that it disappeared.
+    for(const previous of prior) {
+      previous.body=priorBody.get(generation,target.id,previous.id).body;
+      const old=parse(previous.body),incoming=merged.get(previous.id);
+      if(!incoming){
+        retained=true;
+        const decisions=(old.decisions || []).filter(decision=>!observed.has(decision.id));
+        const partIds=new Set(decisions.map(decision=>decision.partId).filter(Boolean));
+        const splitParts=(old.splitParts || []).filter(part=>partIds.has(part.id));
+        const changed=decisions.length!==(old.decisions || []).length;
+        merged.set(previous.id,{...old,decisions,splitParts,gaps:[...new Set([...(old.gaps || []),'Source was absent from the latest partial refresh.',...(changed?['A refreshed decision no longer references this amendment.']:[])])]});
+        continue;
+      }
+      const stale=[];
+      for(const field of incoming.conflicted?[]:['originalText','proposedText','targetLabel','language','listId','justification','onBehalfOf']){
+        if(field==='onBehalfOf'&&!incoming.proposerRetained&&(incoming.authors?.length||incoming.committeeProposer))continue;
+        if(['originalText','proposedText'].includes(field)&&(incoming.textIntegrity==='incomplete'||old.textIntegrity==='incomplete'||invalidBaseline(old)||amendmentTextLosses(null,old).length))continue;
+        if(incoming[field]==null&&old[field]!=null){incoming[field]=old[field];if(['originalText','proposedText'].includes(field))incoming[field.replace('Text','Formatting')]=old[field.replace('Text','Formatting')] || [];if(field==='targetLabel')Object.assign(incoming,checkedLabel(old));incoming.fieldSources={...(incoming.fieldSources || {}),[field]:field==='targetLabel'?old.targetLabelSource || null:old.fieldSources?.[field] || (['originalText','proposedText','language'].includes(field)?old.wordingSource:old.metadataSource) || null};stale.push(field);}
+      }
+      const acceptedProposer=checkedProposer(old);
+      const retainProposer=()=>Object.assign(incoming,{proposerSource:old.proposerSource || old.metadataSource || null,proposerRetained:true,proposerDate:acceptedProposer.proposerDate,proposerDateBasis:acceptedProposer.proposerDateBasis});
+      if(!incoming.conflicted && !incoming.committeeProposer && !incoming.authors?.length && old.authors?.length){incoming.authors=acceptedProposer.authors;retainProposer();stale.push('authors');}
+      else if(!incoming.conflicted&&!old.conflicted&&!incoming.committeeProposer&&!incoming.authors?.length&&old.committeeProposer){incoming.committeeProposer=old.committeeProposer;retainProposer();stale.push('committee proposer');}
+      else incoming.authors=(incoming.authors || []).map(author=>{
+        const accepted=(old.authors || []).find(item=>item.name===author.name&&item.personId!=null);
+        // Missing inputs can retain an accepted link, but an explicit fresh
+        // ambiguity or inactive mandate invalidates that link immediately.
+        if(author.personId==null&&accepted&&acceptedProposer.proposerDate&&acceptedProposer.proposerDate===amendmentProposerDate(incoming)?.date&&['missing','missing_mandate'].includes(author.status)){stale.push('author identity');return {...accepted,latestResolution:author};}return author;
+      });
+      const decisionKey=decision=>decision.id+':'+(decision.partId || '');
+      const decisions=new Map((incoming.decisions || []).map(decision=>[decisionKey(decision),decision]));
+      const currentDecisionIds=new Set((incoming.decisions || []).map(decision=>decision.id));
+      // A published decision node's reference set is atomic. Its current parts
+      // replace prior bindings; only entirely absent decisions are retained.
+      for(const decision of old.decisions || [])if(!currentDecisionIds.has(decision.id)&&!observed.has(decision.id)){decisions.set(decisionKey(decision),decision);stale.push('decisions');}
+      incoming.decisions=[...decisions.values()];
+      const retainedPartIds=new Set(incoming.decisions.filter(decision=>!currentDecisionIds.has(decision.id)).map(decision=>decision.partId).filter(Boolean));
+      incoming.splitParts=[...new Map([...(old.splitParts || []).filter(part=>retainedPartIds.has(part.id)),...(incoming.splitParts || [])].map(part=>[part.id,part])).values()];
+      if(stale.length){retained=true;incoming.retainedComponents=[...new Set(stale)];incoming.gaps=[...new Set([...(incoming.gaps || []),'Some previously accepted components are retained because the latest refresh is incomplete.'])];incoming.sources=[...new Map([...(incoming.sources || []),...(old.sources || [])].map(source=>[source.url+':'+source.fetchedAt,source])).values()];}
+    }
+    // A newly parsed exact component can update a retained decision without
+    // inventing a binding to any other component, target or namespace.
+    const splitGaps=new Set(['A split component has no indexed description.','A split description could not be parsed; the failure is retained for a future parser update.','Split descriptions are parsed as selection plans; exact wording spans have not been validated.','The split description has no exact recorded source page; candidate page provenance is retained.']);
+    for(const row of merged.values()) {
+      Object.assign(row,checkedAggregateAttribution(row));
+      Object.assign(row,checkedProposer(row),checkedLabel(row));
+      if(row.variants)row.variants=row.variants.map(variant=>({...checkedProposer(variant),...checkedLabel(variant)}));
+      if([row,...(row.variants || [])].some(record=>record.authors?.length&&!record.proposerDate))extraGaps.add(proposerDateGap);
+      row.gaps=(row.gaps || []).filter(gap=>gap!=='An amendment decision has no exact recorded source page; candidate page provenance is retained.');
+      if((row.decisions || []).some(decision=>!decision.source?.url)){row.gaps.push('An amendment decision has no exact recorded source page; candidate page provenance is retained.');extraGaps.add('Some amendment decisions have no exact recorded source page.');}
+      Object.assign(row,checkedAmendmentBindings(row));
+      const partIds=new Set((row.decisions || []).map(decision=>decision.partId).filter(Boolean));
+      const parts=new Map((row.splitParts || []).filter(part=>partIds.has(part.id)).map(part=>[part.id,part]));
+      for(const id of partIds)if(freshParts.has(id))parts.set(id,freshParts.get(id));
+      row.splitParts=[...parts.values()];
+      Object.assign(row,checkedAmendmentBindings(row));
+      if(!row.splitCoverageComplete)extraGaps.add(SPLIT_BINDING_GAP);
+      row.gaps=(row.gaps || []).filter(gap=>!splitGaps.has(gap)&&!((row.decisions || []).length&&gap==='No explicit amendment outcome is indexed.'));
+      for(const id of partIds) {
+        const part=parts.get(id);
+        if(!part)row.gaps.push('A split component has no indexed description.');
+        else if(part.status==='unresolved')row.gaps.push('A split description could not be parsed; the failure is retained for a future parser update.');
+        else row.gaps.push('Split descriptions are parsed as selection plans; exact wording spans have not been validated.');
+        if(part&&!part.source?.url){row.gaps.push('The split description has no exact recorded source page; candidate page provenance is retained.');extraGaps.add('Some split descriptions have no exact recorded source page.');}
+        if(!part||part.status==='unresolved')extraGaps.add('Some split components have incomplete description or parsing evidence.');
+      }
+      row.sources=[...new Map([...(row.sources || []),...row.splitParts.map(part=>part.source),...(row.decisions || []).map(decision=>decision.source)].filter(source=>source?.url).map(source=>[source.url+':'+(source.language || '')+':'+source.fetchedAt,source])).values()];
+      const textLosses=amendmentTextLosses(null,row);
+      const oldParser=(row.listId || row.textParserVersion!=null || typeof row.originalText==='string' || typeof row.proposedText==='string')&&row.textParserVersion!==AMENDMENT_EXTRACTION_VERSION;
+      if(invalidBaseline(row)||oldParser||textLosses.length) {
+        row.originalText=null;row.proposedText=null;row.originalFormatting=[];row.proposedFormatting=[];row.textIntegrity='incomplete';row.wordingRetained=false;
+        row.gaps.push(...textLosses.map(gap=>gap.message || gap.code));
+        if(invalidBaseline(row))row.gaps.push('Earlier wording has no verified baseline compatible with the current document parser and is withheld.');
+        if(oldParser)row.gaps.push(wordingUpgradeGap);
+        extraGaps.add('Some amendment wording is withheld because its complete extraction could not be verified.');
+      }
+      if(row.variants?.length)row.variants=row.variants.map(variant=>{
+        const losses=amendmentTextLosses(null,{...variant,number:row.number}),incompatible=invalidBaseline(variant)||variant.textParserVersion!==AMENDMENT_EXTRACTION_VERSION;
+        if(!incompatible&&!losses.length)return variant;
+        row.gaps.push('Some retained amendment variants have unverified wording, which is withheld.');
+        extraGaps.add('Some amendment variant wording is withheld because its complete extraction could not be verified.');
+        return {...variant,originalText:null,proposedText:null,originalFormatting:[],proposedFormatting:[],textIntegrity:'incomplete',wordingRetained:false,gaps:[...new Set([...(variant.gaps || []),...losses.map(gap=>gap.message || gap.code),...(incompatible?['Earlier wording has no verified baseline compatible with the current document parser and is withheld.']:[])])]};
+      });
+      if(listRelationshipsKnown!==false&&currentLists&&row.listId&&!currentLists.has(row.listId)) {
+        row.listRelationship='absent-current-relationship';
+        row.gaps.push('This amendment list is absent from the current target relationships; its earlier evidence is retained.');
+        extraGaps.add('A previously indexed amendment list is absent from the current target relationships; its evidence is retained.');
+      }
+      if(listRelationshipsKnown===false) {
+        if(row.listId&&!currentLists?.has(row.listId)){row.listRelationship='unverified';row.gaps.push('The current amendment-list relationship is unavailable; this list evidence is unverified and retained.');}
+        if(row.variants?.length)row.variants=row.variants.map(variant=>currentLists?.has(variant.listId)?variant:{...variant,listRelationship:'unverified',gaps:[...new Set([...(variant.gaps || []),'The current amendment-list relationship is unavailable; this list evidence is unverified and retained.'])]});
+        extraGaps.add('Current amendment-list relationships are unavailable; previously indexed list evidence is unverified and retained.');
+      }
+      row.gaps=[...new Set(row.gaps)];
+      row.topics=checkedTargetTopics(row);
+    }
+    // A target rebuild re-derives every row, but one list refresh usually
+    // changes only its own rows. Identical rows keep their stored bytes.
+    const stored=new Map(prior.map(row=>[row.id,row]));
+    const put=store.db.prepare('INSERT OR REPLACE INTO amendments VALUES (?,?,?,?,?,?)');
+    const memberDependencies=new Set();
+    for(const row of merged.values()) {
+      // Include parallel-language and ambiguous resolution candidates whose
+      // member IDs may be absent from the raw extracted author names.
+      for(const record of [row,...(row.variants || [])])for(const author of record.authors || []) {
+        for(const value of [author.personId,...(author.evidence || []).map(proof=>proof.personId)]) {
+          const person=String(value ?? '').replace(/^person\//,'');
+          if(/^[1-9]\d*$/.test(person))memberDependencies.add(person);
+        }
+      }
+      const outcome=amendmentRowOutcome(row),date=row.date || target.date || '',body=JSON.stringify({...row,outcome}),previous=stored.get(row.id);
+      if(previous?.body===body&&previous.date===date&&previous.outcome===outcome)continue;
+      put.run(generation,row.id,target.id,date,outcome,body);
+    }
+    const dependency=store.db.prepare('INSERT OR IGNORE INTO amendment_member_dependencies VALUES (?,?,?)');
+    for(const person of memberDependencies)dependency.run(generation,person,target.id);
+    const sittingIds=[...new Set([...(target.sittingIds || []),...[...merged.values()].flatMap(row=>(row.decisions || []).map(decision=>decision.sittingId).filter(Boolean))])];
+    store.db.prepare('INSERT OR REPLACE INTO amendment_targets VALUES (?,?,?)').run(generation,target.id,JSON.stringify({...target,...coverage,proposerComplete:coverage.proposerComplete??Boolean(merged.size&&[...merged.values()].every(row=>[row,...(row.variants||[])].some(variant=>variant.authors?.length&&variant.authors.every(author=>resolvedAmendmentAuthorId(author))))),sittingIds,...(retained||extraGaps.size?{complete:false,gaps:[...new Set([...(coverage.gaps || []),...extraGaps,...(retained?['Previously accepted amendment components are retained after an incomplete refresh.']:[])])]}: {})}));
+  });
+}
+export function amendmentFailureSummary(store) {
+  const row=store.db.prepare("SELECT COUNT(*) AS total,COALESCE(SUM(CASE WHEN json_extract(body,'$.status')='unresolved' THEN 1 ELSE 0 END),0) AS unresolved FROM amendment_split_failures").get();
+  return {...row,capacityReached:Boolean(store.get('amendmentFailureCapacityReached'))};
+}
+export function amendmentFailures(store,{limit=20,offset=0,status='all'}={}) {
+  const where=status==='all'?'':" WHERE json_extract(body,'$.status')=?",args=status==='all'?[]:[status];
+  const total=store.db.prepare('SELECT COUNT(*) AS n FROM amendment_split_failures'+where).get(...args).n;
+  const items=store.db.prepare('SELECT body FROM amendment_split_failures'+where+" ORDER BY json_extract(body,'$.lastOccurrence') DESC,request_id,part_id LIMIT ? OFFSET ?").all(...args,limit,offset).map(row=>{const item=parse(row.body);return {...item,message:item.reason,firstSeen:item.firstOccurrence,lastSeen:item.lastOccurrence,occurrences:item.count};});
+  const summary=amendmentFailureSummary(store);
+  return {items,total,limit,offset,parserVersion:SPLIT_PARSER_VERSION,unresolved:summary.unresolved,capacityReached:summary.capacityReached,summary};
+}
+export function amendmentGeneration(store) {
+  const core=store.get('working')?.generation || store.get('active') || 0;
+  return store.db.prepare('SELECT 1 FROM amendment_targets WHERE generation=? LIMIT 1').get(core)?core:extensionGeneration(store.db) || core;
+}
+/** One exact indexed selection, with the same wording/binding guards as a page. */
+export function amendmentById(store,{document,id,language='en'}={}) {
+  if(store.db.isTransaction)return readAmendmentById(store,{document,id,language});
+  // A deferred transaction pins metadata and the exact row to one read snapshot
+  // without taking the existing writer's reservation.
+  store.db.exec('BEGIN');
+  try {
+    const result=readAmendmentById(store,{document,id,language});
+    store.db.exec('COMMIT');
+    return result;
+  } catch(error) {
+    try {if(store.db.isTransaction)store.db.exec('ROLLBACK');}catch {/* Preserve the read's original failure. */}
+    throw error;
+  }
+}
+function readAmendmentById(store,{document,id,language}) {
+  const committee=committeeAmendmentReference(id);
+  if(committee) {
+    const generation=amendmentGeneration(store),saved=store.db.prepare('SELECT body FROM amendments WHERE generation=? AND target=? AND id=?').get(generation,committeeScopeKey(committee.listId),id);
+    if(!saved)return null;
+    const row=checkedAmendmentRead(parse(saved.body));
+    if(row.id!==id||row.scope!=='committee'||row.listId!==committee.listId||row.number!==committee.number||row.identityConflict||
+      document&&document!==row.targetDocumentId&&document!==row.listId)return null;
+    return {...row,requestedLanguage:language};
+  }
+  if(!amendmentTarget(document,{agendaItems:()=>upcomingAgenda(store,amendmentGeneration(store))})||typeof id!=='string')return null;
+  const reference=canonicalEPReference(id)||canonicalEPReference('eli/dl/doc/'+id);
+  const identity=amendmentReference(reference);
+  if(!identity||identity.targetDocumentId!==document)return null;
+  const generation=amendmentGeneration(store);
+  const rows=store.db.prepare(`SELECT id,body FROM amendments WHERE generation=? AND target=? AND
+    (id=? OR (json_type(amendments.body,'$.officialIds')='array' AND EXISTS(SELECT 1 FROM json_each(amendments.body,'$.officialIds') AS official
+      WHERE (CASE WHEN official.type='object' THEN json_extract(official.value,'$.id') ELSE official.value END) IN (?,?,?)))) LIMIT 2`)
+    .all(generation,document,identity.id,reference,'https://data.europarl.europa.eu/'+reference,'http://data.europarl.europa.eu/'+reference);
+  // An alias shared by two records is not a reliable individual selection.
+  if(rows.length!==1)return null;
+  const record=parse(rows[0].body);
+  if(record.id!==rows[0].id||record.targetDocumentId!==document||amendmentReference('eli/dl/doc/'+record.id)?.targetDocumentId!==document)return null;
+  const row=withScheduledVotes(store,generation,checkedAmendmentRead(record));
+  return {...row,title:row.titles?.[languagePreference(Object.keys(row.titles||{}).filter(code=>row.titles[code]?.trim()),language)[0]] || document,requestedLanguage:language};
+}
+function checkedEmptyObservation(record,document,rowCount) {
+  const proof=record?.emptyObservation,source=proof?.source;
+  // This proves only the published list relationship was observed empty. It
+  // cannot erase retained records or establish a census of oral/other changes.
+  return rowCount===0&&record?.id===document&&record.listProjectionVersion===AMENDMENT_LINKS_VERSION&&
+    record.linkedListObservationCount===0&&record.unresolvedListObservationCount===0&&
+    proof?.version===AMENDMENT_EMPTY_OBSERVATION_VERSION&&proof.documentId===document&&proof.listCount===0&&
+    proof.relationship==='inverse_foresees_change_of'&&proof.scope==='published-amendment-list-relationships'&&
+    source?.url==='https://data.europarl.europa.eu/api/v2/plenary-documents/'+document+'?format=application%2Fld%2Bjson'&&
+    typeof source.fetchedAt==='string'&&Number.isFinite(Date.parse(source.fetchedAt))?proof:null;
+}
+export function amendmentsPage(store,{document=null,procedure=null,member=null,outcome=null,language='en',limit=20,offset=0,scope='plenary',list=null,committee=null}={}) {
+  if(store.get('amendmentReadVersion')!==amendmentReadVersion)throw new HttpError(503,'activity_index_initializing','The activity index is preparing its local query indexes. Retry shortly.');
+  const generation=amendmentGeneration(store),clauses=['generation=?'],args=[generation];
+  if(scope!=='all')clauses.push(scope==='committee'?"target GLOB 'committee:*'":"target NOT GLOB 'committee:*'");
+  if(document){clauses.push(scope==='committee'?"json_extract(body,'$.targetDocumentId')=?":'target=?');args.push(document);}
+  if(list){clauses.push('target=?');args.push(committeeScopeKey(list));}
+  if(committee){clauses.push("EXISTS(SELECT 1 FROM json_each(amendments.body,'$.committees') c WHERE json_extract(c.value,'$.code')=?)");args.push(committee);}
+  if(outcome){clauses.push(`(CASE WHEN ${splitUnverifiedSql('amendments.body')} THEN 'unavailable' ELSE outcome END)=?`);args.push(outcome);}
+  if(procedure){clauses.push("EXISTS(SELECT 1 FROM json_each(amendments.body,'$.procedureIds') AS p WHERE p.value=?)");args.push(procedure);}
+  if(member){clauses.push(`(${memberMatchesSql('amendments.body')} OR EXISTS(SELECT 1 FROM json_each(amendments.body,'$.variants') AS variant WHERE ${memberMatchesSql('variant.value')}))`);args.push(String(member),'person/'+member,String(member),'person/'+member);}
+  const projected=fastReadsReady(store,generation,'amendments');
+  const scalar=projected&&!committee&&!outcome&&!procedure&&!member&&!(document&&scope==='committee');
+  const table=projected?'(SELECT page.*,source.body FROM amendment_page_reads page JOIN amendments source ON source.generation=page.generation AND source.id=page.id) amendments':'amendments',where=clauses.join(' AND '),total=store.db.prepare('SELECT COUNT(*) AS n FROM '+(scalar?'amendment_page_reads':table)+' WHERE '+where).get(...args).n;
+  const pageSql=scalar?'SELECT source.body FROM (SELECT generation,id,date,target,number FROM amendment_page_reads WHERE '+where+' ORDER BY date DESC,target,number,id LIMIT ? OFFSET ?) page JOIN amendments source ON source.generation=page.generation AND source.id=page.id ORDER BY page.date DESC,page.target,page.number,page.id':'SELECT body FROM '+table+' WHERE '+where+" ORDER BY date DESC,target,"+(projected?'number':"CAST(json_extract(body,'$.number') AS INTEGER)")+",id LIMIT ? OFFSET ?";
+  const upcomingContext=scope!=='committee'?upcomingScopeContext(store,generation):null;
+  const items=store.db.prepare(pageSql).all(...args,limit,offset).map(record=>{
+    const row=withScheduledVotes(store,generation,checkedAmendmentRead(parse(record.body)),upcomingContext);
+
+    if(member) {
+      const {memberId,basis,variantListIds}=amendmentAuthorMatch(row,member);
+      row.authorMatch={memberId,basis,variantListIds};
+    }
+    return {...row,title:row.titles?.[languagePreference(Object.keys(row.titles||{}).filter(code=>row.titles[code]?.trim()),language)[0]] || row.targetDocumentId,requestedLanguage:language};
+  });
+  const records=store.db.prepare('SELECT body FROM '+(fastReadsReady(store,generation,'targets')?'amendment_target_reads':'amendment_targets')+' WHERE generation=?'+(scope==='committee'&&list?' AND id=?':scope!=='committee'&&document?' AND id=?':'')+' LIMIT 10001').all(generation,...(scope==='committee'&&list?[committeeScopeKey(list)]:scope!=='committee'&&document?[document]:[])).map(record=>parse(record.body))
+    .filter(record=>(scope==='all'||(record.scope||'plenary')===scope)&&(!document||scope!=='committee'||record.targetDocumentId===document)&&(!procedure||record.procedureIds?.includes(procedure))&&(!committee||record.committees?.some(value=>value.code===committee)));
+  const gaps=[...new Set(records.flatMap(record=>record.gaps || []))];
+  const listProjectionUnverified=records.some(record=>record.scope==='committee'?record.committeeProjectionVersion!==1:record.listProjectionVersion!==AMENDMENT_LINKS_VERSION);
+  if(listProjectionUnverified)gaps.push('Amendment-list observation coverage is unverified until the current document projection refreshes its source.');
+  // Verify the cached scope before pagination, so a stale later page cannot
+  // produce complete coverage on an otherwise current first page. Reads never
+  // rewrite the retained source or indexed JSON used by older workers.
+  const readCoverage=store.db.prepare(`SELECT COUNT(*) AS rows,COALESCE(MAX(wording),0) wording,COALESCE(MAX(proposer),0) proposer,
+    COALESCE(MAX(splits),0) splits,COALESCE(MAX(freshness),0) freshness FROM amendment_read_flags WHERE generation=? AND target IN (SELECT value FROM json_each(?))`)
+    .get(generation,JSON.stringify(records.map(record=>record.id)));
+  if(readCoverage.wording)gaps.push(wordingUpgradeGap);
+  if(readCoverage.proposer)gaps.push(proposerDateGap);
+  if(readCoverage.splits)gaps.push(SPLIT_BINDING_GAP);
+  if(readCoverage.freshness)gaps.push(sourceFreshnessGap);
+  const targetGaps=[...gaps];
+  const working=store.get('working'),active=store.get('active');
+  const generations=[...new Set([generation,working?.generation,active].filter(Boolean))];
+  const refreshGaps=generations.some(id=>store.db.prepare("SELECT 1 FROM refresh_gaps WHERE generation=? AND kind IN ('document','motion-outcomes') LIMIT 1").get(id));
+  if(refreshGaps)gaps.push('Some document or sitting sources remain unavailable after bounded retries.');
+  const pending=Boolean(generations.some(id=>store.db.prepare('SELECT 1 FROM amendment_jobs WHERE generation=? AND done<>1 LIMIT 1').get(id)||store.db.prepare("SELECT 1 FROM sources WHERE generation=? AND key='amendment:continuations' AND (json_array_length(json_extract(body,'$.tasks'))>0 OR json_array_length(json_extract(body,'$.discovery'))>0) LIMIT 1").get(id))||[...new Set([working?.generation,active].filter(Boolean))].some(id=>store.db.prepare("SELECT 1 FROM tasks WHERE generation=? AND kind IN ('document','motion-outcomes') AND (done IS NULL OR done<>1) LIMIT 1").get(id)));
+  const capacityGaps=generations.flatMap(id=>{
+    const row=store.db.prepare("SELECT json_extract(body,'$.capacityGap') AS gap FROM sources WHERE generation=? AND key='amendment:continuations'").get(id);
+    if(!row?.gap)return [];
+    let detail;try {detail=JSON.parse(row.gap);}catch {detail=null;}
+    return [typeof detail?.message==='string'?detail.message:'Some amendment discovery was deferred after the checkpoint capacity was reached.'];
+  });
+  gaps.push(...new Set(capacityGaps));
+  if(!records.length){const gap=document?'This document has no indexed amendment records.':'Amendment discovery is incomplete.';gaps.push(gap);targetGaps.push(gap);}
+  if(!document&&!list)gaps.push('Coverage includes indexed '+scope+' amendment sources; older sources are enriched in bounded batches.');
+  const lastUpdated=records.map(record=>record.lastUpdated).filter(Boolean).sort().at(-1) || null;
+  const indexedObservationComplete=Boolean((document||list)&&readCoverage.rows>0&&records.length&&records.every(record=>record.complete)&&!listProjectionUnverified&&!readCoverage.wording&&!readCoverage.proposer&&!readCoverage.splits&&!readCoverage.freshness);
+  const emptyObservation=document&&records.length===1?checkedEmptyObservation(records[0],document,readCoverage.rows):null;
+  const observationComplete=indexedObservationComplete||Boolean(emptyObservation);
+  const scheduledLists=upcomingContext?.agenda&&document?store.db.prepare("SELECT body FROM sources WHERE generation=? AND kind='amendment-list' AND json_extract(body,'$.targetDocumentId')=? LIMIT ?").all(generation,document,AMENDMENT_LIMITS.listsPerTarget).map(record=>{const list=parse(record.body);return {listId:list.identifier,scheduledVotes:scheduledVotes(upcomingSource(store,generation,'/plenary-documents/'+document),list,upcomingContext.items,{today:upcomingContext.today,votingLists:upcomingContext.votingLists})};}):null;
+  return {schemaVersion:AMENDMENTS_API_VERSION,items,total,offset,limit,scheduledLists,coverage:{complete:Boolean(indexedObservationComplete&&!pending&&!capacityGaps.length&&!refreshGaps),observationComplete,emptyObservation,targetGaps,discovery:{pending,refreshGaps,capacityGaps},
+    observationScope:emptyObservation?'published-amendment-list-relationships':'indexed-'+scope+'-amendment-sources',indexed:Boolean(records.length),pending,gaps,lastUpdated,parserVersion:SPLIT_PARSER_VERSION,scope,servingGeneration:generation,workingGeneration:Boolean(working?.generation===generation),...(scope==='committee'?{discoveryCoverage:records.length?'partial':'unavailable',wordingCoverage:records.length&&!readCoverage.wording&&!readCoverage.freshness&&records.every(record=>record.wordingComplete)?'complete':'partial',proposerCoverage:records.length&&records.every(record=>record.proposerComplete)?'complete':'partial',outcomeCoverage:'unavailable'}:{})},failures:amendmentFailureSummary(store)};
+}
+
+export function amendmentCompletionMarker(task,today) {
+  return task.done===1&&task.kind==='motion-outcomes'&&task.key.includes(':'+today)?{key:task.key,kind:task.kind,sittingId:parse(task.body).sittingId}:null;
+}
+export function enqueueAmendment(store,generation,key,kind,body,priority=105,refreshCompleted=false,{deferOnCapacity=false}={}) {
+  store.assertWriter();
+  if(!kind.startsWith('amendment-') && store.db.prepare('SELECT 1 FROM refresh_gaps WHERE generation=? AND key=?').get(generation,key))return false;
+  const enqueue=()=>{
+    // Recovery can adopt an ordinary delayed job. Add its intent without
+    // replacing the saved cursor or resetting failure/backoff state.
+    const recoveryBody=task=>{
+      if(body.parserUpgrade!==true||!['amendment-list-detail','amendment-extract'].includes(kind)||task.kind!==kind||task.done===1||typeof task.body!=='string')return task.body;
+      const saved=parse(task.body);
+      return saved.listId===body.listId&&saved.targetDocumentId===body.targetDocumentId&&saved.parserUpgrade!==true?JSON.stringify({...saved,parserUpgrade:true}):task.body;
+    };
+    const existing=store.db.prepare('SELECT kind,body,done FROM amendment_jobs WHERE generation=? AND key=?').get(generation,key);
+    if(existing) {
+      const updated=recoveryBody(existing);
+      if(updated!==existing.body)store.db.prepare('UPDATE amendment_jobs SET body=? WHERE generation=? AND key=? AND done=0').run(updated,generation,key);
+    }
+    if(!existing) {
+      const checkpointKey='amendment:continuations',saved=store.source(generation,checkpointKey)?.work || {};
+      const saveCheckpoint=work=>store.db.prepare('INSERT OR REPLACE INTO sources VALUES (?,?,?,?,?,1)').run(generation,checkpointKey,'amendment-continuations',JSON.stringify(work),new Date(store.clock()).toISOString());
+      if([...(saved.tasks || []),...(saved.discovery || [])].some(task=>task.key===key)) {
+        let changed=false;
+        const merge=tasks=>(tasks || []).map(task=>{
+          if(task.key!==key)return task;
+          const updated=recoveryBody(task);if(updated===task.body)return task;
+          changed=true;return {...task,body:updated};
+        });
+        const tasks=merge(saved.tasks),discovery=merge(saved.discovery);
+        if(changed)saveCheckpoint({...saved,tasks,discovery});
+        return true;
+      }
+      if(store.db.prepare('SELECT COUNT(*) AS n FROM amendment_jobs WHERE generation=?').get(generation).n>=200) {
+        const today=new Intl.DateTimeFormat('en-CA',{timeZone:'Europe/Brussels',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(store.clock()));
+        const completed=new Map((saved.completed || []).filter(task=>task.key.includes(':'+today)).map(task=>[task.key,task]));
+        const reclaim=store.db.prepare("SELECT * FROM amendment_jobs WHERE generation=? AND done=1 ORDER BY (kind='motion-outcomes'),key").all(generation).find(task=>{
+          const marker=amendmentCompletionMarker(task,today);return !marker||completed.has(marker.key)||completed.size<200;
+        });
+        if(reclaim) {
+          const marker=amendmentCompletionMarker(reclaim,today);
+          if(marker){completed.set(marker.key,marker);saveCheckpoint({...saved,completed:[...completed.values()]});}
+          store.db.prepare('DELETE FROM amendment_jobs WHERE generation=? AND key=?').run(generation,reclaim.key);
+        } else {
+          if(deferOnCapacity)return false;
+          const tasks=[...(saved.tasks || [])];
+          if(tasks.length<200) {
+            tasks.push({generation,key,kind,body:JSON.stringify(body),priority,done:0,attempts:0,retry_at:0,error:null});
+            saveCheckpoint({...saved,tasks});return true;
+          }
+          // Only untouched discovery reaches this limit; admitted cursors stay
+          // in the direct queue or its reserved full snapshots.
+          const capacityGap={count:(saved.capacityGap?.count || 0)+1,message:'Additional untouched amendment discovery exceeded the bounded checkpoint and is deferred to normal catalogue refresh.'};
+          saveCheckpoint({...saved,capacityGap});
+          // An unchanged JSON UPDATE still fires every source projection trigger.
+          // Saturation can recur after each job; only invalidate present markers.
+          invalidateAmendmentLinks(store,generation);
+          return false;
+        }
+      }
+    }
+    store.db.prepare('INSERT OR IGNORE INTO amendment_jobs(generation,key,kind,body,priority) VALUES (?,?,?,?,?)').run(generation,key,kind,JSON.stringify(body),priority);
+    if(refreshCompleted)store.db.prepare('UPDATE amendment_jobs SET done=0,attempts=0,error=NULL,retry_at=0,body=?,priority=? WHERE generation=? AND key=? AND done=1').run(JSON.stringify(body),priority,generation,key);
+    return true;
+  };
+  return store.db.isTransaction?enqueue():store.transaction(enqueue);
+}
+export function nextAmendmentTask(store,generation) {
+  const row=store.db.prepare("SELECT * FROM amendment_jobs WHERE generation=? AND done=0 AND retry_at<=? AND COALESCE(json_extract(body,'$.upcomingUntil'),0)<=? ORDER BY priority DESC,key DESC LIMIT 1").get(generation,store.clock(),store.clock());
+  return row?{...row,body:parse(row.body),amendmentJob:true}:null;
+}
+
+// Writer-only upgrade: bounded primary-key pages, committed with their cursor.
+export const amendmentDependenciesReady=(store,generation)=>Boolean(store.db.prepare('SELECT ready FROM amendment_dependency_bootstrap WHERE generation=?').get(generation)?.ready);
+export function bootstrapAmendmentDependencies(store,generation,limit=25) {
+  return store.transaction(()=>{
+    store.assertWriter();
+    const state=store.db.prepare('SELECT * FROM amendment_dependency_bootstrap WHERE generation=?').get(generation)||{stage:'amendments',after_key:'',ready:0};
+    if(state.ready)return true;
+    const rows=state.stage==='amendments'
+      ?store.db.prepare('SELECT id AS key,target,body FROM amendments WHERE generation=? AND id>? ORDER BY id LIMIT ?').all(generation,state.after_key,limit)
+      :store.db.prepare("SELECT key,body FROM sources WHERE generation=? AND kind='amendment-list' AND key>? ORDER BY key LIMIT ?").all(generation,state.after_key,limit);
+    const name=store.db.prepare('INSERT OR IGNORE INTO amendment_author_targets VALUES (?,?,?)'),member=store.db.prepare('INSERT OR IGNORE INTO amendment_member_dependencies VALUES (?,?,?)');
+    for(const row of rows) {
+      if(state.stage==='amendments')for(const person of store.db.prepare('SELECT person_id FROM amendment_contributors WHERE generation=? AND amendment_id=?').all(generation,row.key))member.run(generation,person.person_id,row.target);
+      const body=JSON.parse(row.body),target=row.target||body.scopeKey||body.targetDocumentId;
+      if(!target)continue;
+      for(const record of state.stage==='amendments'?[body,...(body.variants||[])]:body.extraction?.amendments||[])for(const author of record.authors||[]) {
+        const raw=typeof author==='string'?author:author.name;
+        if(raw)name.run(generation,String(raw).normalize('NFC').trim().replace(/\s+/gu,' ').toLocaleLowerCase('und'),target);
+        if(typeof author==='object')for(const id of [author.personId,...(author.evidence||[]).map(p=>p.personId)]) {
+          const person=String(id??'').replace(/^person\//,'');if(/^[1-9]\d*$/.test(person))member.run(generation,person,target);
+        }
+      }
+    }
+    const exhausted=rows.length<limit,ready=exhausted&&state.stage==='lists';
+    store.db.prepare('INSERT OR REPLACE INTO amendment_dependency_bootstrap VALUES (?,?,?,?)').run(generation,exhausted?'lists':state.stage,exhausted?'':rows.at(-1).key,Number(ready));
+    return ready;
+  });
+}

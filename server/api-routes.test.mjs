@@ -1,0 +1,51 @@
+import {memberVotes} from './member-votes.mjs';
+import {loopback} from './test-support/loopback.mjs';
+import {test} from 'node:test';
+import {versionedApiUrl} from './api-version.mjs';
+import assert from 'node:assert/strict';
+import {mkdtemp,rm} from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
+test('flat browser API preserves bounded reads, search POSTs and conditional responses',loopback,async t=>{
+  const directory=await mkdtemp(path.join(os.tmpdir(),'flat-api-'));
+  process.env.ERROR_LOG_DIR=path.join(directory,'diagnostics');
+  process.env.ACTIVITY_INDEX_ENABLED='true';process.env.ACTIVITY_INDEX_DIR=directory;
+  process.env.CORPUS_ENABLED='false';delete process.env.ODP_CACHE_DIR;
+  const {server}=await import('./index.mjs');
+  const {activityIndex}=await import('./activity-index-worker.mjs');
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  t.after(async()=>{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));activityIndex().store.close();await (await import('./error-log.mjs')).errorLog.flush();await rm(directory,{recursive:true,force:true});});
+  const base=`http://127.0.0.1:${server.address().port}`,read=globalThis.fetch;
+  t.mock.method(globalThis,'fetch',()=>{throw Error('Route tests must not read public sources');});
+  const request=(route,options)=>read(versionedApiUrl(`${base}/api/${route}`),options);
+  // These top-level names must survive transport admission before source
+  // availability is considered (the production voting-lists 404 regression).
+  const voteStore=activityIndex().store;assert(voteStore.acquire());voteStore.release();
+  const snapshot=t.mock.method(memberVotes,'snapshot',async()=>({id:'a'.repeat(64),days:[{sittingId:'MTG-PL-2026-09-15',date:'2026-09-15',agenda:[],results:[],decisions:[],requests:[]}],coverage:{status:'complete'}}));
+  try{
+    for(const route of ['voting-lists?sitting=MTG-PL-2026-11-12','upcoming-votes?sitting=MTG-PL-2026-09-15','ballot-comparisons?sitting=MTG-PL-2026-09-15']){
+      const response=await request(route);assert.equal(response.status,200,route+' must be admitted, including empty source data');const data=await response.json();assert.deepEqual(data.documents||data.items,[]);
+    }
+  }finally{snapshot.mock.restore();}
+
+  for(const route of ['upcoming-votes?sitting=invalid','ballot-comparisons?sitting=invalid','ballot-comparisons?sitting=MTG-PL-2026-09-15&decision=MTG-PL-2026-09-15-DEC-1','ballot-comparisons?sitting=MTG-PL-2026-09-15&lang=en&lang=fr','commission-followups/B-10-2025-0247','provisional-agreement/A-10-2025-0061','provisional-agreement/A-10-2025-0061?amendment=A-10-2025-0061-AM-299&list=A-10-2025-0061-AM-299-299','provisional-agreement/TA-10-2026-0171?lang=en','provisional-agreement/A-10-2025-0061?amendment=A-10-2025-0061-AM-299&list=A-10-2025-0061-AM-299-299&wording-lang=en&url=x','commission-followups/TA-10-2025-0247?url=x','commission-followups/TA-10-2025-0247?lang=en&lang=fr','profile/0','profile/1?lang=en&lang=hu','directory?other=1','directory?retry=invalid','directory?retry=committee-details&retry=committee-details','portrait/1?other=1','speech-context/invalid','motion-amendments/invalid','member-votes/0','vote-periods?unknown=1','vote-periods?lang=en','speech-transcript/invalid?lang=bad','speeches/1?offset=1e2','source-record?url=x&url=y','amendments?limit=0','outside/directory?term=8','corpus/search?q=climate&other=1'])assert.equal((await request(route)).status,400,route);
+  assert.equal((await request('corpus/status')).status,503,'a disabled corpus stays unavailable');
+  for(const route of ['session','admin','unknown','ballot-comparison/MTG-PL-2026-09-15-DEC-196237'])assert.equal((await request(route)).status,404,route);
+  assert.equal((await request('hemicycle/xxx')).status,404,'only the two chambers exist');
+  assert.equal((await request('hemicycle/str?lang=en')).status,400,'the plan takes no query');
+  assert.equal((await request('profile/1',{method:'POST'})).status,405);
+  assert.equal((await request('directory',{headers:{Origin:'https://other.example'}})).status,403);
+  for(const [headers,body,status] of [[{'Content-Type':'application/json'},'{',400],[{'Content-Type':'text/plain'},'{}',415],[{'Content-Type':'application/json'},' '.repeat(128*1024+1),413]])assert.equal((await request('corpus/search',{method:'POST',headers,body})).status,status);
+  const options=await request('corpus/search',{method:'OPTIONS'});
+  assert.equal(options.status,204);assert.equal(options.headers.get('Allow'),'GET, HEAD, POST, OPTIONS');
+  const get=await request('activity-index/status');assert.equal(get.status,200);const etag=get.headers.get('ETag');await get.json();
+  const head=await request('activity-index/status',{method:'HEAD'});assert.equal(head.status,200);assert.equal(await head.text(),'');
+  const cached=await request('activity-index/status',{headers:{'If-None-Match':etag}});assert.equal(cached.status,304);assert.equal(await cached.text(),'');
+  const reported=await request('client-errors',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:'http',request:'/api/profile/1?lang=hu&q=private',status:502,method:'GET'})});
+  assert.equal(reported.status,204);assert.equal(reported.headers.get('Cache-Control'),'no-store');
+  assert.match(reported.headers.get('X-Request-Id'),/^[a-f0-9-]{36}$/);
+  assert.equal((await request('client-errors',{method:'POST',headers:{Origin:'https://other.example','Content-Type':'application/json'},body:'{}'})).status,403);
+  const discovery=await (await read(base+'/api')).json();assert(discovery.endpoints.includes('directory'));assert(!discovery.endpoints.includes('poc'));
+  for(const route of ['poc/directory','poc/profile/1','poc/corpus/search','poc/motion-amendments/B-10-2026-0424','poc/member-votes/43','poc/healthz','poc/poc/directory'])for(const method of ['GET','HEAD','POST','OPTIONS'])assert.equal((await request(route,{method})).status,404,`${method} ${route}`);
+});

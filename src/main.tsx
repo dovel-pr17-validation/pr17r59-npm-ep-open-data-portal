@@ -1,0 +1,18 @@
+import {installErrorDiagnostics} from './errorDiagnostics.mjs';
+import {API_ROOT} from './api';
+import {PlenaryLiveProvider} from './PlenaryLive';
+import {appUiI18n} from './appUiI18n';
+import {interfaceTerm} from './terms.mjs';
+import {UiI18nProvider} from './UiI18nReact';
+import { StrictMode, Suspense } from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App';
+import './theme.css';
+import './base.css';
+import {applyColourScheme,readColourScheme} from './colourScheme.mjs';
+import {RootBoundary} from './ErrorBoundary';
+installErrorDiagnostics(window,API_ROOT+'/client-errors');
+applyColourScheme(readColourScheme());
+const initialLanguage=new URLSearchParams(window.location.search).get('lang');
+const loading=interfaceTerm('loading-view',initialLanguage||'en');
+createRoot(document.getElementById('root')!).render(<StrictMode><RootBoundary><Suspense fallback={<p role="status" lang={loading.language}>{loading.text}</p>}><UiI18nProvider i18n={appUiI18n} language={initialLanguage}><PlenaryLiveProvider><App /></PlenaryLiveProvider></UiI18nProvider></Suspense></RootBoundary></StrictMode>);

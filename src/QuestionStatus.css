@@ -1,0 +1,2 @@
+.explorer-question-status-icon { display:inline-grid; place-items:center; width:20px; height:20px; font-size:20px; line-height:1; }
+.explorer-question-status[data-answered=true] .explorer-question-status-icon { border-radius:50%; background:var(--positive); color:var(--surface); font-size:14px; }
